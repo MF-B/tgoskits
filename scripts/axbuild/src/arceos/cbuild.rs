@@ -334,6 +334,7 @@ fn platform_linker_owner_prefix(platform: &str, features: &[String]) -> &'static
 
     match platform {
         "loongarch64-qemu-virt" => "ax-plat-loongarch64-qemu-virt-",
+        "loongarch64-ls2k1000" => "ax-plat-loongarch64-ls2k1000-",
         "x86-qemu-q35" => "ax-plat-x86-qemu-q35-",
         _ => "ax-hal-",
     }
@@ -718,6 +719,14 @@ mod tests {
         let features = map_c_app_features(&strings(&["multitask"]), &[]);
 
         assert!(features.contains(&"multitask".to_string()));
+    }
+
+    #[test]
+    fn loongarch_ls2k1000_linker_is_platform_owned() {
+        assert_eq!(
+            platform_linker_owner_prefix("loongarch64-ls2k1000", &[]),
+            "ax-plat-loongarch64-ls2k1000-"
+        );
     }
 
     #[test]

@@ -1019,6 +1019,7 @@ fn is_known_ax_hal_platform_feature(platform: &str) -> bool {
             | "riscv64-sg2002"
             | "riscv64-visionfive2"
             | "loongarch64-qemu-virt"
+            | "loongarch64-ls2k1000"
             | "x86-qemu-q35"
     )
 }
@@ -1777,6 +1778,16 @@ mod tests {
         ] {
             assert_eq!(ax_hal_platform_feature_name(feature, Some(&metadata)), None);
         }
+    }
+
+    #[test]
+    fn ls2k1000_is_ax_hal_platform_feature() {
+        let metadata = repo_metadata();
+
+        assert_eq!(
+            ax_hal_platform_feature_name("ax-hal/loongarch64-ls2k1000", Some(&metadata)),
+            Some("loongarch64-ls2k1000")
+        );
     }
 
     #[test]

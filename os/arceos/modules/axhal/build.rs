@@ -45,6 +45,11 @@ const PLATFORM_FEATURES: &[PlatformFeature] = &[
         target_arch: Some("loongarch64"),
         crate_name: "ax_plat_loongarch64_qemu_virt",
     },
+    PlatformFeature {
+        feature: "loongarch64-ls2k1000",
+        target_arch: Some("loongarch64"),
+        crate_name: "ax_plat_loongarch64_ls2k1000",
+    },
 ];
 
 const DEFAULT_PLATFORMS: &[(&str, &str)] = &[
@@ -76,7 +81,7 @@ fn main() {
     let platform_linker_is_external = selected_platform.is_some_and(|platform| {
         matches!(
             platform.feature,
-            "plat-dyn" | "x86-qemu-q35" | "loongarch64-qemu-virt"
+            "plat-dyn" | "x86-qemu-q35" | "loongarch64-qemu-virt" | "loongarch64-ls2k1000"
         )
     });
 

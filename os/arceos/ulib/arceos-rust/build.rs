@@ -333,6 +333,7 @@ fn platform_linker_owner_prefix_for(platform: &str, is_dynamic_platform: bool) -
 
     match platform {
         "loongarch64-qemu-virt" => "ax-plat-loongarch64-qemu-virt-",
+        "loongarch64-ls2k1000" => "ax-plat-loongarch64-ls2k1000-",
         "x86-qemu-q35" => "ax-plat-x86-qemu-q35-",
         _ => "ax-hal-",
     }
@@ -592,6 +593,10 @@ mod tests {
         assert_eq!(
             platform_linker_owner_prefix_for("loongarch64-qemu-virt", false),
             "ax-plat-loongarch64-qemu-virt-"
+        );
+        assert_eq!(
+            platform_linker_owner_prefix_for("loongarch64-ls2k1000", false),
+            "ax-plat-loongarch64-ls2k1000-"
         );
     }
 

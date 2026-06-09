@@ -1043,6 +1043,7 @@ dependencies = [
  "ax-page-table-multiarch",
  "ax-percpu",
  "ax-plat",
+ "ax-plat-loongarch64-ls2k1000",
  "ax-plat-loongarch64-qemu-virt",
  "ax-plat-riscv64-sg2002",
  "ax-plat-riscv64-visionfive2",
@@ -1331,6 +1332,24 @@ dependencies = [
  "irq-framework",
  "rdrive",
  "spin 0.12.0",
+]
+
+[[package]]
+name = "ax-plat-loongarch64-ls2k1000"
+version = "0.5.11"
+dependencies = [
+ "ax-config-macros",
+ "ax-cpu",
+ "ax-driver",
+ "ax-kspin",
+ "ax-lazyinit",
+ "ax-page-table-entry",
+ "ax-plat",
+ "axklib",
+ "chrono",
+ "log",
+ "loongArch64",
+ "toml 1.1.2+spec-1.1.0",
 ]
 
 [[package]]
