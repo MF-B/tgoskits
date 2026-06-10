@@ -50,24 +50,45 @@ fn init_rtc() {
     // low-32bit value of the TOY counter, which stores seconds and other time information
     let toy_low = unsafe { (rtc_base_ptr.add(SYS_TOY_READ0) as *const u32).read_volatile() };
 
-    let date_time = Utc
-        .with_ymd_and_hms(
-            1900 + toy_high as i32,
-            extract_bits(toy_low, 26..32),
-            extract_bits(toy_low, 21..26),
-            extract_bits(toy_low, 16..21),
-            extract_bits(toy_low, 10..16),
-            extract_bits(toy_low, 4..10),
-        )
-        .unwrap()
-        .with_nanosecond(extract_bits(toy_low, 0..4) * ax_plat::time::NANOS_PER_MILLIS as u32)
-        .unwrap();
+    let year = 1900 + toy_high as i32;
+    let month = extract_bits(toy_low, 26..32);
+    let day = extract_bits(toy_low, 21..26);
+    let hour = extract_bits(toy_low, 16..21);
+    let minute = extract_bits(toy_low, 10..16);
+    let second = extract_bits(toy_low, 4..10);
+    let nanosecond = extract_bits(toy_low, 0..4) * ax_plat::time::NANOS_PER_MILLIS as u32;
 
-    if let Some(epoch_time_nanos) = date_time.timestamp_nanos_opt() {
-        unsafe {
-            RTC_EPOCHOFFSET_NANOS =
-                epoch_time_nanos as u64 - TimeIfImpl::ticks_to_nanos(TimeIfImpl::current_ticks());
-        }
+    info!(
+        "RTC TOY raw: high={toy_high:#010x}, low={toy_low:#010x}, \
+         decoded={year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{nanosecond:09}"
+    );
+
+    let Some(date_time) = Utc
+        .with_ymd_and_hms(year, month, day, hour, minute, second)
+        .single()
+    else {
+        warn!("invalid RTC TOY date/time; keep wall-time epoch offset at 0");
+        return;
+    };
+
+    let Some(date_time) = date_time.with_nanosecond(nanosecond) else {
+        warn!("invalid RTC TOY nanosecond field; keep wall-time epoch offset at 0");
+        return;
+    };
+
+    let Some(epoch_time_nanos) = date_time.timestamp_nanos_opt() else {
+        warn!("RTC TOY timestamp is outside supported range; keep wall-time epoch offset at 0");
+        return;
+    };
+
+    let Ok(epoch_time_nanos) = u64::try_from(epoch_time_nanos) else {
+        warn!("RTC TOY timestamp is before Unix epoch; keep wall-time epoch offset at 0");
+        return;
+    };
+
+    unsafe {
+        RTC_EPOCHOFFSET_NANOS = epoch_time_nanos
+            .saturating_sub(TimeIfImpl::ticks_to_nanos(TimeIfImpl::current_ticks()));
     }
 }
 
