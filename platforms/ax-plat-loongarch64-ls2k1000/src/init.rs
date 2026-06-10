@@ -34,6 +34,7 @@ impl InitIf for InitIfImpl {
         #[cfg(feature = "irq")]
         crate::irq::init();
         crate::time::init_percpu();
+        crate::drivers::init();
         #[cfg(feature = "smp")]
         {
             ax_plat::irq::set_enable(crate::config::devices::IPI_IRQ, true);

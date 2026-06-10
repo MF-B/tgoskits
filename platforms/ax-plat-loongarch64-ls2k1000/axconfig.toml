@@ -92,6 +92,8 @@ liointc-irq = 0x02                      # uint
 
 ahci-paddr = 0x400E_0000                # uint
 ahci-irq = 19                           # uint
+# Linux DTS uses `ports-implemented = <0x01>` for the LS2K1000 AHCI node.
+ahci-ports-implemented = 0x1            # uint
 
 gmac0-paddr = 0x4004_0000               # uint
 gmac0-irq = 12                          # uint
