@@ -5,17 +5,40 @@ use ax_plat::{
     mem::{pa, phys_to_virt},
 };
 
+#[cfg(feature = "irq")]
+use crate::config::devices::UART_IRQ;
 use crate::config::devices::UART_PADDR;
 
 const UART_RBR: usize = 0;
 const UART_THR: usize = 0;
 const UART_IER: usize = 1;
 const UART_FCR: usize = 2;
+#[cfg(feature = "irq")]
+const UART_IIR: usize = 2;
 const UART_LCR: usize = 3;
 const UART_LSR: usize = 5;
+#[cfg(feature = "irq")]
+const UART_MSR: usize = 6;
 
 const LSR_DATA_READY: u8 = 1 << 0;
 const LSR_THR_EMPTY: u8 = 1 << 5;
+
+#[cfg(feature = "irq")]
+const IER_DATA_READY: u8 = 1 << 0;
+#[cfg(feature = "irq")]
+const IIR_NO_INT: u8 = 1 << 0;
+#[cfg(feature = "irq")]
+const IIR_ID_MASK: u8 = 0x0e;
+#[cfg(feature = "irq")]
+const IIR_MODEM_STATUS: u8 = 0x00;
+#[cfg(feature = "irq")]
+const IIR_THR_EMPTY: u8 = 0x02;
+#[cfg(feature = "irq")]
+const IIR_DATA_READY: u8 = 0x04;
+#[cfg(feature = "irq")]
+const IIR_LINE_STATUS: u8 = 0x06;
+#[cfg(feature = "irq")]
+const IIR_RX_TIMEOUT: u8 = 0x0c;
 
 fn uart_base() -> *mut u8 {
     phys_to_virt(pa!(UART_PADDR)).as_mut_ptr()
@@ -33,6 +56,26 @@ fn write_byte(byte: u8) {
         }
         uart.add(UART_THR).write_volatile(byte);
     }
+}
+
+fn read_pending(bytes: &mut [u8]) -> usize {
+    let uart = uart_base();
+    let mut read = 0;
+    unsafe {
+        for byte in bytes {
+            if uart.add(UART_LSR).read_volatile() & LSR_DATA_READY == 0 {
+                break;
+            }
+            *byte = uart.add(UART_RBR).read_volatile();
+            read += 1;
+        }
+    }
+    read
+}
+
+#[cfg(feature = "irq")]
+fn read_reg(offset: usize) -> u8 {
+    unsafe { uart_base().add(offset).read_volatile() }
 }
 
 pub(crate) fn init_early() {
@@ -58,24 +101,13 @@ impl ConsoleIf for ConsoleIfImpl {
     /// Reads bytes from the console into the given mutable slice.
     /// Returns the number of bytes read.
     fn read_bytes(bytes: &mut [u8]) -> usize {
-        let uart = uart_base();
-        let mut read = 0;
-        unsafe {
-            for byte in bytes {
-                if uart.add(UART_LSR).read_volatile() & LSR_DATA_READY == 0 {
-                    break;
-                }
-                *byte = uart.add(UART_RBR).read_volatile();
-                read += 1;
-            }
-        }
-        read
+        read_pending(bytes)
     }
 
     /// Returns the IRQ number for the console, if applicable.
     #[cfg(feature = "irq")]
     fn irq_num() -> Option<usize> {
-        None
+        Some(UART_IRQ)
     }
 
     #[cfg(feature = "irq")]
@@ -83,21 +115,29 @@ impl ConsoleIf for ConsoleIfImpl {
         let uart = uart_base();
         unsafe {
             uart.add(UART_IER)
-                .write_volatile(if enabled { 0x05 } else { 0x00 });
+                .write_volatile(if enabled { IER_DATA_READY } else { 0x00 });
         }
     }
 
     #[cfg(feature = "irq")]
     fn handle_irq() -> ConsoleIrqEvent {
-        let uart = uart_base();
-        let lsr = unsafe { uart.add(UART_LSR).read_volatile() };
-        let mut event = ConsoleIrqEvent::empty();
-        if lsr & LSR_DATA_READY != 0 {
-            event |= ConsoleIrqEvent::RX_READY;
+        let iir = read_reg(UART_IIR);
+        if iir & IIR_NO_INT != 0 {
+            return ConsoleIrqEvent::empty();
         }
-        if lsr & 0x1e != 0 {
-            event |= ConsoleIrqEvent::RX_ERROR;
+
+        match iir & IIR_ID_MASK {
+            IIR_LINE_STATUS => {
+                let _ = read_reg(UART_LSR);
+                ConsoleIrqEvent::RX_ERROR
+            }
+            IIR_DATA_READY | IIR_RX_TIMEOUT => ConsoleIrqEvent::RX_READY,
+            IIR_MODEM_STATUS => {
+                let _ = read_reg(UART_MSR);
+                ConsoleIrqEvent::empty()
+            }
+            IIR_THR_EMPTY => ConsoleIrqEvent::empty(),
+            _ => ConsoleIrqEvent::empty(),
         }
-        event
     }
 }

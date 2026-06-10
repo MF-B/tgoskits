@@ -7,7 +7,9 @@ use loongArch64::{
     },
 };
 
-use crate::config::devices::{IPI_IRQ, TIMER_IRQ};
+use crate::config::devices::{IPI_IRQ, LIOINTC_IRQ, TIMER_IRQ};
+
+mod liointc;
 
 const IOCSR_IPI_SEND_CPU_SHIFT: u32 = 16;
 const IOCSR_IPI_SEND_BLOCKING: u32 = 1 << 31;
@@ -28,14 +30,25 @@ fn make_ipi_send_value(cpu_id: usize, vector: u32, blocking: bool) -> u32 {
 }
 
 pub(crate) fn init() {
-    // External LIOINTC routing is board-specific and will be wired after
-    // timer/IPI bring-up is verified.
+    liointc::init();
+    set_cpu_irq_line(LIOINTC_IRQ, true);
+}
+
+fn set_cpu_irq_line(irq: usize, enabled: bool) {
+    let line = LineBasedInterrupt::from_bits_retain(1 << irq);
+    let old_value = ecfg::read().lie();
+    let new_value = match enabled {
+        true => old_value | line,
+        false => old_value & !line,
+    };
+    ecfg::set_lie(new_value);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IrqType {
     Timer,
     Ipi,
+    Io,
     Ex(usize),
 }
 
@@ -44,6 +57,7 @@ impl IrqType {
         match irq {
             TIMER_IRQ => Self::Timer,
             IPI_IRQ => Self::Ipi,
+            LIOINTC_IRQ => Self::Io,
             n => Self::Ex(n),
         }
     }
@@ -52,6 +66,7 @@ impl IrqType {
         match self {
             IrqType::Timer => TIMER_IRQ,
             IrqType::Ipi => IPI_IRQ,
+            IrqType::Io => LIOINTC_IRQ,
             IrqType::Ex(n) => *n,
         }
     }
@@ -60,6 +75,7 @@ impl IrqType {
         match self {
             IrqType::Timer => Some(LineBasedInterrupt::TIMER),
             IrqType::Ipi => Some(LineBasedInterrupt::IPI),
+            IrqType::Io => Some(LineBasedInterrupt::from_bits_retain(1 << LIOINTC_IRQ)),
             _ => None,
         }
     }
@@ -78,7 +94,16 @@ impl IrqIf for IrqIfImpl {
                 let value = if enabled { u32::MAX } else { 0 };
                 iocsr_write_w(IOCSR_IPI_ENABLE, value);
             }
-            IrqType::Ex(irq) => debug!("External IRQ {irq} enable={enabled} is not wired yet"),
+            IrqType::Ex(irq) => {
+                let ok = if enabled {
+                    liointc::enable_irq(irq)
+                } else {
+                    liointc::disable_irq(irq)
+                };
+                if !ok {
+                    warn!("External IRQ {irq} is outside the supported LIOINTC range");
+                }
+            }
             _ => {}
         }
 
@@ -94,9 +119,21 @@ impl IrqIf for IrqIfImpl {
 
     /// Handles the IRQ.
     fn handle(irq: usize) -> Option<usize> {
-        let irq = IrqType::new(irq);
+        let mut irq = IrqType::new(irq);
+
+        if irq == IrqType::Io {
+            let Some(ex_irq) = liointc::claim_irq() else {
+                debug!("Spurious LIOINTC IRQ");
+                return None;
+            };
+            irq = IrqType::Ex(ex_irq);
+        }
 
         trace!("IRQ {irq:?}");
+
+        if irq == IrqType::Timer {
+            ticlr::clear_timer_interrupt();
+        }
 
         if let IrqType::Ipi = irq {
             let mut status = iocsr_read_w(IOCSR_IPI_STATUS);
@@ -118,8 +155,8 @@ impl IrqIf for IrqIfImpl {
             }
         }
 
-        if irq == IrqType::Timer {
-            ticlr::clear_timer_interrupt();
+        if let IrqType::Ex(irq) = irq {
+            liointc::complete_irq(irq);
         }
 
         Some(irq.as_usize())

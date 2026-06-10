@@ -87,7 +87,8 @@ reboot-mask = 0x1                       # uint
 
 liointc-paddr = 0x1FE0_1400             # uint
 liointc-isr-paddr = 0x1FE0_1040         # uint
-liointc-irq = 0x03                      # uint
+# LIOINTC route INT0 is delivered as CPU HWI0 (ECFG bit 2).
+liointc-irq = 0x02                      # uint
 
 ahci-paddr = 0x400E_0000                # uint
 ahci-irq = 19                           # uint
