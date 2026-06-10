@@ -26,9 +26,10 @@ ax-page-table-entry = { workspace = true }
 
 ax-config-macros = { workspace = true }
 ax-cpu = { workspace = true }
-ax-driver = { workspace = true, features = ["plat-static"] }
+ax-driver = { workspace = true, features = ["plat-static", "block"] }
 ax-plat = { workspace = true }
 axklib = { workspace = true, features = ["tlsf"] }
+rdif-block.workspace = true
 
 [package.metadata.axplat]
 platform = "loongarch64-ls2k1000"

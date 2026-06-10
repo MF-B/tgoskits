@@ -1,5 +1,3 @@
 mod ahci;
 
-pub(crate) fn init() {
-    ahci::probe();
-}
+pub(crate) fn init() {}

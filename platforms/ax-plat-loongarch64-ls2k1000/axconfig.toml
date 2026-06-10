@@ -35,9 +35,13 @@ kernel-base-paddr = 0x0020_0000                 # uint
 # Base virtual address of the kernel image.
 kernel-base-vaddr = "0x9000_0000_0020_0000"     # uint
 # Kernel address space base.
-kernel-aspace-base = "0x9000_0000_0000_0000"    # uint
+#
+# The LS2K1000 platform uses two DMW windows: 0x8000... for uncached MMIO and
+# 0x9000... for cached RAM/kernel memory. Paging kernels need both windows in
+# the kernel address space because axmm maps every platform memory region.
+kernel-aspace-base = "0x8000_0000_0000_0000"    # uint
 # Kernel address space size.
-kernel-aspace-size = "0x0000_ffff_ffff_f000"    # uint
+kernel-aspace-size = "0x1000_ffff_ffff_f000"    # uint
 # Stack size on bootstrapping. (256K)
 boot-stack-size = 0x40000                       # uint
 
