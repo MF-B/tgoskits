@@ -5,8 +5,6 @@ use ax_plat::{
     mem::{pa, phys_to_virt},
 };
 
-#[cfg(feature = "irq")]
-use crate::config::devices::UART_IRQ;
 use crate::config::devices::UART_PADDR;
 
 const UART_RBR: usize = 0;
@@ -107,7 +105,7 @@ impl ConsoleIf for ConsoleIfImpl {
     /// Returns the IRQ number for the console, if applicable.
     #[cfg(feature = "irq")]
     fn irq_num() -> Option<usize> {
-        Some(UART_IRQ)
+        None
     }
 
     #[cfg(feature = "irq")]
