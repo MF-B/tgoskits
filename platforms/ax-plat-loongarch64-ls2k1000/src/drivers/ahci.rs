@@ -148,7 +148,9 @@ struct AhciDmaSegment {
 }
 
 impl AhciDmaSegment {
-    const EMPTY: Self = Self { bus: 0, len: 0 };
+    const fn new(bus: u64, len: usize) -> Self {
+        Self { bus, len }
+    }
 }
 
 struct AtaDmaCommand<'a> {
@@ -508,7 +510,7 @@ fn setup_ata_dma_command(
     dma_barrier();
 
     let label = command.label;
-    info!(
+    trace!(
         "AHCI port{port} {label} setup: lba={}, sectors={}, ctba={cmd_table_paddr:#x}, prdt={}, \
          bytes={}, buf={first_bus:#x}",
         command.lba,
@@ -549,7 +551,7 @@ fn setup_ata_nodata_command(
     dma_barrier();
 
     let label = command.label;
-    info!("AHCI port{port} {label} setup: ctba={cmd_table_paddr:#x}");
+    trace!("AHCI port{port} {label} setup: ctba={cmd_table_paddr:#x}");
     Ok(())
 }
 
@@ -579,7 +581,7 @@ fn wait_command_done(port: usize) -> bool {
             dma_barrier();
             let is = read_port_reg_u32(port, PORT_IS);
             let tfd = read_port_reg_u32(port, PORT_TFD);
-            info!("AHCI port{port} command done: is={is:#010x}, tfd={tfd:#010x}");
+            trace!("AHCI port{port} command done: is={is:#010x}, tfd={tfd:#010x}");
             return tfd & (PORT_TFD_BSY | PORT_TFD_DRQ | PORT_TFD_ERR) == 0;
         }
         busy_wait(Duration::from_millis(1));
@@ -797,36 +799,50 @@ fn ahci_queue_limits() -> QueueLimits {
     }
 }
 
-fn collect_request_segments(
-    segments: &[Segment<'_>],
-) -> Result<([AhciDmaSegment; AHCI_MAX_PRDT_ENTRIES], usize), BlkError> {
-    let mut dma_segments = [AhciDmaSegment::EMPTY; AHCI_MAX_PRDT_ENTRIES];
-    let mut count = 0;
+fn request_segments_len(segments: &[Segment<'_>]) -> usize {
+    segments.iter().map(|segment| segment.len).sum()
+}
+
+fn copy_from_request_segments(segments: &[Segment<'_>], offset: usize, dst: &mut [u8]) {
+    let mut skipped = offset;
+    let mut copied = 0;
 
     for segment in segments {
-        if segment.len == 0 {
+        if copied == dst.len() {
+            break;
+        }
+        if skipped >= segment.len {
+            skipped -= segment.len;
             continue;
         }
-        if segment.len > AHCI_PRDT_MAX_BYTES || count == AHCI_MAX_PRDT_ENTRIES {
-            return Err(BlkError::InvalidRequest);
-        }
-        let len = segment.len as u64;
-        if segment.bus.checked_add(len - 1).is_none() {
-            return Err(BlkError::InvalidRequest);
-        }
 
-        dma_segments[count] = AhciDmaSegment {
-            bus: segment.bus,
-            len: segment.len,
-        };
-        count += 1;
+        let start = skipped;
+        let len = (segment.len - start).min(dst.len() - copied);
+        dst[copied..copied + len].copy_from_slice(&segment[start..start + len]);
+        copied += len;
+        skipped = 0;
     }
+}
 
-    if count == 0 {
-        return Err(BlkError::InvalidRequest);
+fn copy_to_request_segments(segments: &mut [Segment<'_>], offset: usize, src: &[u8]) {
+    let mut skipped = offset;
+    let mut copied = 0;
+
+    for segment in segments {
+        if copied == src.len() {
+            break;
+        }
+        if skipped >= segment.len {
+            skipped -= segment.len;
+            continue;
+        }
+
+        let start = skipped;
+        let len = (segment.len - start).min(src.len() - copied);
+        segment[start..start + len].copy_from_slice(&src[copied..copied + len]);
+        copied += len;
+        skipped = 0;
     }
-
-    Ok((dma_segments, count))
 }
 
 fn comreset_port(port: usize) {
@@ -996,10 +1012,7 @@ impl AhciPort {
 
     fn read_dma(&self, ptrs: &DmaPtrs, lba: u64, buf: &mut [u8]) -> Result<(), AhciError> {
         let sectors = buf.len() / AHCI_SECTOR_SIZE;
-        let segments = [AhciDmaSegment {
-            bus: dma_paddr(ptrs.buffer),
-            len: buf.len(),
-        }];
+        let segments = [AhciDmaSegment::new(dma_paddr(ptrs.buffer), buf.len())];
         self.issue_dma_command(
             ptrs,
             AtaDmaCommand {
@@ -1018,46 +1031,93 @@ impl AhciPort {
         Ok(())
     }
 
-    fn read_dma_segments(
+    fn read_request(
         &self,
         ptrs: &DmaPtrs,
         lba: u64,
         sectors: u16,
-        segments: &[AhciDmaSegment],
+        segments: &mut [Segment<'_>],
     ) -> Result<(), AhciError> {
-        self.issue_dma_command(
-            ptrs,
-            AtaDmaCommand {
-                command: ATA_CMD_READ_DMA_EXT,
-                segments,
-                lba,
-                sectors,
-                device: ATA_DEVICE_LBA,
-                write: false,
-                label: "READ",
-            },
-        )
+        let total_len = sectors as usize * AHCI_SECTOR_SIZE;
+        if request_segments_len(segments) != total_len {
+            return Err(AhciError::InvalidBufferSize);
+        }
+
+        let mut sector_offset = 0usize;
+        let mut byte_offset = 0usize;
+        while sector_offset < sectors as usize {
+            let chunk_sectors = (sectors as usize - sector_offset).min(AHCI_MAX_TRANSFER_SECTORS);
+            let chunk_len = chunk_sectors * AHCI_SECTOR_SIZE;
+            let chunk_lba = lba
+                .checked_add(sector_offset as u64)
+                .ok_or(AhciError::LbaOutOfRange)?;
+            let dma_segments = [AhciDmaSegment::new(dma_paddr(ptrs.buffer), chunk_len)];
+
+            self.issue_dma_command(
+                ptrs,
+                AtaDmaCommand {
+                    command: ATA_CMD_READ_DMA_EXT,
+                    segments: &dma_segments,
+                    lba: chunk_lba,
+                    sectors: chunk_sectors as u16,
+                    device: ATA_DEVICE_LBA,
+                    write: false,
+                    label: "READ",
+                },
+            )?;
+
+            let dma_buf =
+                unsafe { core::slice::from_raw_parts(ptrs.buffer as *const u8, chunk_len) };
+            copy_to_request_segments(segments, byte_offset, dma_buf);
+            sector_offset += chunk_sectors;
+            byte_offset += chunk_len;
+        }
+
+        Ok(())
     }
 
-    fn write_dma_segments(
+    fn write_request(
         &self,
         ptrs: &DmaPtrs,
         lba: u64,
         sectors: u16,
-        segments: &[AhciDmaSegment],
+        segments: &[Segment<'_>],
     ) -> Result<(), AhciError> {
-        self.issue_dma_command(
-            ptrs,
-            AtaDmaCommand {
-                command: ATA_CMD_WRITE_DMA_EXT,
-                segments,
-                lba,
-                sectors,
-                device: ATA_DEVICE_LBA,
-                write: true,
-                label: "WRITE",
-            },
-        )
+        let total_len = sectors as usize * AHCI_SECTOR_SIZE;
+        if request_segments_len(segments) != total_len {
+            return Err(AhciError::InvalidBufferSize);
+        }
+
+        let mut sector_offset = 0usize;
+        let mut byte_offset = 0usize;
+        while sector_offset < sectors as usize {
+            let chunk_sectors = (sectors as usize - sector_offset).min(AHCI_MAX_TRANSFER_SECTORS);
+            let chunk_len = chunk_sectors * AHCI_SECTOR_SIZE;
+            let chunk_lba = lba
+                .checked_add(sector_offset as u64)
+                .ok_or(AhciError::LbaOutOfRange)?;
+            let dma_buf = unsafe { core::slice::from_raw_parts_mut(ptrs.buffer, chunk_len) };
+            copy_from_request_segments(segments, byte_offset, dma_buf);
+            let dma_segments = [AhciDmaSegment::new(dma_paddr(ptrs.buffer), chunk_len)];
+
+            self.issue_dma_command(
+                ptrs,
+                AtaDmaCommand {
+                    command: ATA_CMD_WRITE_DMA_EXT,
+                    segments: &dma_segments,
+                    lba: chunk_lba,
+                    sectors: chunk_sectors as u16,
+                    device: ATA_DEVICE_LBA,
+                    write: true,
+                    label: "WRITE",
+                },
+            )?;
+
+            sector_offset += chunk_sectors;
+            byte_offset += chunk_len;
+        }
+
+        Ok(())
     }
 
     fn flush_cache(&self, ptrs: &DmaPtrs) -> Result<(), AhciError> {
@@ -1075,7 +1135,7 @@ impl AhciPort {
             return Err(AhciError::CommandFailed);
         }
 
-        info!("AHCI port{} FLUSH done", self.index);
+        trace!("AHCI port{} FLUSH done", self.index);
         Ok(())
     }
 
@@ -1206,24 +1266,22 @@ unsafe impl IQueue for AhciQueue {
 
         match request.op {
             RequestOp::Read => {
-                let (segments, count) = collect_request_segments(request.segments)?;
                 self.port
-                    .read_dma_segments(
+                    .read_request(
                         &ptrs,
                         request.lba,
                         request.block_count as u16,
-                        &segments[..count],
+                        request.segments,
                     )
                     .map_err(|_| BlkError::Other("AHCI read failed"))?;
             }
             RequestOp::Write => {
-                let (segments, count) = collect_request_segments(request.segments)?;
                 self.port
-                    .write_dma_segments(
+                    .write_request(
                         &ptrs,
                         request.lba,
                         request.block_count as u16,
-                        &segments[..count],
+                        request.segments,
                     )
                     .map_err(|_| BlkError::Other("AHCI write failed"))?;
             }
