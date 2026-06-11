@@ -137,8 +137,23 @@ pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) ->
                         let signo = match kind {
                             ExceptionKind::Misaligned => {
                                 #[cfg(target_arch = "loongarch64")]
-                                if unsafe { uctx.emulate_unaligned() }.is_ok() {
-                                    break 'exc;
+                                match unsafe { uctx.emulate_unaligned_at(exc_info.badv as u64) } {
+                                    Ok(()) => break 'exc,
+                                    Err(err) => {
+                                        let exe_path = thr.proc_data.exe_path.read().clone();
+                                        warn!(
+                                            "loongarch64 unaligned emulation failed: task={}, \
+                                             pid={}, exe='{}', ip={:#x}, fault_addr={:#x}, \
+                                             err={}, info={:?}",
+                                            curr.id_name(),
+                                            thr.proc_data.proc.pid(),
+                                            exe_path,
+                                            uctx.ip(),
+                                            exception_fault_addr(&exc_info),
+                                            err,
+                                            exc_info,
+                                        );
+                                    }
                                 }
                                 Signo::SIGBUS
                             }
