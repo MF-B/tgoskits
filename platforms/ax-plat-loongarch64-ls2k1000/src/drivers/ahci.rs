@@ -69,6 +69,10 @@ const AHCI_CMD_LIST_SIZE: usize = 1024;
 const AHCI_RX_FIS_SIZE: usize = 256;
 const AHCI_IDENTIFY_SIZE: usize = 512;
 const AHCI_SECTOR_SIZE: usize = 512;
+
+// Keep request data behind a single bounce buffer until LS2K1000 AHCI direct
+// DMA to caller buffers has validated cache-maintenance semantics. The block
+// queue limits below mirror this temporary 64 KiB transfer window.
 const AHCI_MAX_TRANSFER_SECTORS: usize = 128;
 const AHCI_TRANSFER_BUFFER_SIZE: usize = AHCI_SECTOR_SIZE * AHCI_MAX_TRANSFER_SECTORS;
 const AHCI_CMD_TABLE_PRDT_OFFSET: usize = 128;
@@ -79,14 +83,6 @@ const AHCI_PRDT_INTERRUPT_ON_COMPLETION: u32 = 1 << 31;
 const AHCI_PRDT_MAX_BYTES: usize = AHCI_PRDT_BYTE_COUNT_MASK as usize + 1;
 const AHCI_CMD_TABLE_SIZE: usize =
     AHCI_CMD_TABLE_PRDT_OFFSET + AHCI_MAX_PRDT_ENTRIES * AHCI_PRDT_ENTRY_SIZE;
-const MBR_PARTITION_TABLE_OFFSET: usize = 446;
-const MBR_PARTITION_ENTRY_SIZE: usize = 16;
-const MBR_PARTITION_COUNT: usize = 4;
-const MBR_PARTITION_TYPE_LINUX: u8 = 0x83;
-const MBR_SIGNATURE: u16 = 0xaa55;
-const EXT4_SUPERBLOCK_LBA_OFFSET: u64 = 2;
-const EXT4_SUPERBLOCK_MAGIC_OFFSET: usize = 0x38;
-const EXT4_SUPERBLOCK_MAGIC: u16 = 0xef53;
 
 const SATA_FIS_TYPE_REGISTER_H2D: u8 = 0x27;
 const SATA_FIS_H2D_COMMAND: u8 = 0x80;
@@ -185,15 +181,6 @@ struct AhciQueue {
     id: usize,
     port: AhciPort,
     capacity_blocks: u64,
-}
-
-#[derive(Clone, Copy)]
-struct MbrPartition {
-    index: usize,
-    boot: u8,
-    part_type: u8,
-    start_lba: u32,
-    sectors: u32,
 }
 
 #[derive(Debug)]
@@ -295,7 +282,7 @@ fn wait_hba_reset_done() -> bool {
 
 fn reset_hba() {
     let ghc = read_reg_u32(REG_GHC);
-    info!("AHCI HBA reset: ghc={ghc:#010x}");
+    trace!("AHCI HBA reset: ghc={ghc:#010x}");
 
     write_reg_u32(REG_GHC, ghc | HOST_CTL_RESET);
     if !wait_hba_reset_done() {
@@ -307,7 +294,7 @@ fn reset_hba() {
     write_reg_u32(REG_GHC, ghc | HOST_CTL_AHCI_EN);
     busy_wait(Duration::from_millis(1));
 
-    info!("AHCI HBA reset done: ghc={:#010x}", read_reg_u32(REG_GHC));
+    trace!("AHCI HBA reset done: ghc={:#010x}", read_reg_u32(REG_GHC));
 }
 
 fn configure_hba_cap() {
@@ -317,9 +304,9 @@ fn configure_hba_cap() {
         return;
     }
 
-    info!("AHCI CAP update: {cap:#010x} -> {new_cap:#010x}");
+    trace!("AHCI CAP update: {cap:#010x} -> {new_cap:#010x}");
     write_reg_u32(REG_CAP, new_cap);
-    info!("AHCI CAP after update: {:#010x}", read_reg_u32(REG_CAP));
+    trace!("AHCI CAP after update: {:#010x}", read_reg_u32(REG_CAP));
 }
 
 fn log_port(port: usize, stage: &str) {
@@ -330,7 +317,7 @@ fn log_port(port: usize, stage: &str) {
     let sctl = read_port_reg_u32(port, PORT_SCTL);
     let serr = read_port_reg_u32(port, PORT_SERR);
 
-    info!(
+    trace!(
         "AHCI port{port} {stage}: cmd={cmd:#010x}, tfd={tfd:#010x}, sig={sig:#010x}, \
          ssts={ssts:#010x}, sctl={sctl:#010x}, serr={serr:#010x}, det={}, spd={}, ipm={}",
         ssts_det(ssts),
@@ -350,11 +337,11 @@ fn power_up_port(port: usize) {
     write_port_reg_u32(port, PORT_CMD, new_cmd);
 }
 
-fn wait_port_link(port: usize, stage: &str) -> bool {
+fn wait_port_link(port: usize, stage: &str, warn_on_timeout: bool) -> bool {
     for _ in 0..AHCI_LINK_TIMEOUT_MILLIS {
         let ssts = read_port_reg_u32(port, PORT_SSTS);
         if ssts_det(ssts) == 0x3 {
-            info!(
+            trace!(
                 "AHCI port{port} link up after {stage}: ssts={ssts:#010x}, spd={}, ipm={}",
                 ssts_spd(ssts),
                 ssts_ipm(ssts),
@@ -365,13 +352,23 @@ fn wait_port_link(port: usize, stage: &str) -> bool {
     }
 
     let ssts = read_port_reg_u32(port, PORT_SSTS);
-    warn!(
-        "AHCI port{port} link not up after {stage} and {AHCI_LINK_TIMEOUT_MILLIS}ms: \
-         ssts={ssts:#010x}, det={}, spd={}, ipm={}",
-        ssts_det(ssts),
-        ssts_spd(ssts),
-        ssts_ipm(ssts),
-    );
+    if warn_on_timeout {
+        warn!(
+            "AHCI port{port} link not up after {stage} and {AHCI_LINK_TIMEOUT_MILLIS}ms: \
+             ssts={ssts:#010x}, det={}, spd={}, ipm={}",
+            ssts_det(ssts),
+            ssts_spd(ssts),
+            ssts_ipm(ssts),
+        );
+    } else {
+        trace!(
+            "AHCI port{port} link not up after {stage} and {AHCI_LINK_TIMEOUT_MILLIS}ms: \
+             ssts={ssts:#010x}, det={}, spd={}, ipm={}",
+            ssts_det(ssts),
+            ssts_spd(ssts),
+            ssts_ipm(ssts),
+        );
+    }
     false
 }
 
@@ -382,7 +379,7 @@ fn clear_port_errors(port: usize, stage: &str) {
     }
 
     write_port_reg_u32(port, PORT_SERR, serr);
-    info!(
+    trace!(
         "AHCI port{port} clear SERR after {stage}: {serr:#010x} -> {:#010x}",
         read_port_reg_u32(port, PORT_SERR),
     );
@@ -392,7 +389,7 @@ fn wait_port_ready(port: usize) -> bool {
     for _ in 0..AHCI_DEVICE_READY_TIMEOUT_MILLIS {
         let tfd = read_port_reg_u32(port, PORT_TFD);
         if tfd & (PORT_TFD_BSY | PORT_TFD_DRQ) == 0 {
-            info!("AHCI port{port} device ready: tfd={tfd:#010x}");
+            trace!("AHCI port{port} device ready: tfd={tfd:#010x}");
             return true;
         }
         busy_wait(Duration::from_millis(1));
@@ -426,7 +423,7 @@ fn start_command_engine(port: usize, ptrs: &DmaPtrs) -> bool {
     write_port_reg_u32(port, PORT_CMD, new_cmd);
     dma_barrier();
 
-    info!(
+    trace!(
         "AHCI port{port} command engine started: clb={cmd_list_paddr:#x}, fb={rx_fis_paddr:#x}, \
          cmd={:#010x}",
         read_port_reg_u32(port, PORT_CMD),
@@ -638,7 +635,7 @@ fn log_identify_data(ptrs: &DmaPtrs) {
     let lba28 = identify_lba28(ptrs);
     let lba48 = identify_lba48(ptrs);
 
-    info!(
+    trace!(
         "AHCI IDENTIFY: model='{model}', serial='{serial}', lba28={lba28}, lba48={lba48}, \
          word0={:#06x}, word83={:#06x}",
         read_identify_word(ptrs, 0),
@@ -659,133 +656,6 @@ fn identify_device(port: usize, ptrs: &DmaPtrs) -> Option<u64> {
 
     log_identify_data(ptrs);
     Some(identify_capacity(ptrs))
-}
-
-fn read_le_u16(buf: &[u8], offset: usize) -> u16 {
-    u16::from_le_bytes([buf[offset], buf[offset + 1]])
-}
-
-fn read_le_u32(buf: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes([
-        buf[offset],
-        buf[offset + 1],
-        buf[offset + 2],
-        buf[offset + 3],
-    ])
-}
-
-fn sector_signature(sector: &[u8; AHCI_SECTOR_SIZE]) -> u16 {
-    ((sector[511] as u16) << 8) | sector[510] as u16
-}
-
-fn log_sector(lba: u64, sector: &[u8; AHCI_SECTOR_SIZE]) {
-    let sig = sector_signature(sector);
-    info!(
-        "AHCI LBA{lba}: first16={:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} \
-         {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}, sig={sig:#06x}",
-        sector[0],
-        sector[1],
-        sector[2],
-        sector[3],
-        sector[4],
-        sector[5],
-        sector[6],
-        sector[7],
-        sector[8],
-        sector[9],
-        sector[10],
-        sector[11],
-        sector[12],
-        sector[13],
-        sector[14],
-        sector[15],
-    );
-}
-
-impl MbrPartition {
-    fn parse(sector: &[u8; AHCI_SECTOR_SIZE], index: usize) -> Self {
-        let offset = MBR_PARTITION_TABLE_OFFSET + index * MBR_PARTITION_ENTRY_SIZE;
-        Self {
-            index,
-            boot: sector[offset],
-            part_type: sector[offset + 4],
-            start_lba: read_le_u32(sector, offset + 8),
-            sectors: read_le_u32(sector, offset + 12),
-        }
-    }
-
-    const fn is_empty(self) -> bool {
-        self.part_type == 0 || self.sectors == 0
-    }
-
-    const fn end_lba(self) -> u64 {
-        self.start_lba as u64 + self.sectors as u64 - 1
-    }
-}
-
-fn log_mbr_partitions(sector: &[u8; AHCI_SECTOR_SIZE]) {
-    let sig = sector_signature(sector);
-    if sig != MBR_SIGNATURE {
-        warn!("AHCI MBR: invalid signature {sig:#06x}");
-        return;
-    }
-
-    for index in 0..MBR_PARTITION_COUNT {
-        let partition = MbrPartition::parse(sector, index);
-        if partition.is_empty() {
-            info!("AHCI MBR partition{index}: empty");
-            continue;
-        }
-
-        info!(
-            "AHCI MBR partition{index}: boot={:#04x}, type={:#04x}, start_lba={}, sectors={}, \
-             end_lba={}",
-            partition.boot,
-            partition.part_type,
-            partition.start_lba,
-            partition.sectors,
-            partition.end_lba(),
-        );
-    }
-}
-
-fn find_linux_partition(sector: &[u8; AHCI_SECTOR_SIZE]) -> Option<MbrPartition> {
-    if sector_signature(sector) != MBR_SIGNATURE {
-        return None;
-    }
-
-    for index in 0..MBR_PARTITION_COUNT {
-        let partition = MbrPartition::parse(sector, index);
-        if !partition.is_empty() && partition.part_type == MBR_PARTITION_TYPE_LINUX {
-            return Some(partition);
-        }
-    }
-
-    None
-}
-
-fn log_ext4_superblock(partition: MbrPartition, sector: &[u8; AHCI_SECTOR_SIZE]) {
-    let magic = read_le_u16(sector, EXT4_SUPERBLOCK_MAGIC_OFFSET);
-    if magic != EXT4_SUPERBLOCK_MAGIC {
-        warn!(
-            "AHCI ext4 partition{}: invalid superblock magic {magic:#06x}",
-            partition.index,
-        );
-        return;
-    }
-
-    let inodes = read_le_u32(sector, 0x00);
-    let blocks = read_le_u32(sector, 0x04);
-    let first_data_block = read_le_u32(sector, 0x14);
-    let log_block_size = read_le_u32(sector, 0x18);
-    let block_size = 1024u32.checked_shl(log_block_size).unwrap_or(0);
-
-    info!(
-        "AHCI ext4 partition{}: magic={magic:#06x}, inodes={inodes}, blocks_lo={blocks}, \
-         first_data_block={first_data_block}, log_block_size={log_block_size}, \
-         block_size={block_size}",
-        partition.index,
-    );
 }
 
 fn ahci_queue_limits() -> QueueLimits {
@@ -852,7 +722,7 @@ fn comreset_port(port: usize) {
     }
 
     let sctl = read_port_reg_u32(port, PORT_SCTL);
-    info!("AHCI port{port} COMRESET: sctl={sctl:#010x}, serr={serr:#010x}");
+    trace!("AHCI port{port} COMRESET: sctl={sctl:#010x}, serr={serr:#010x}");
 
     write_port_reg_u32(
         port,
@@ -869,13 +739,13 @@ fn comreset_port(port: usize) {
 
 fn bring_up_port_link(port: usize) -> bool {
     power_up_port(port);
-    if wait_port_link(port, "power-up") {
+    if wait_port_link(port, "power-up", false) {
         return true;
     }
 
     comreset_port(port);
     power_up_port(port);
-    wait_port_link(port, "COMRESET")
+    wait_port_link(port, "COMRESET", true)
 }
 
 fn effective_port_map(raw_pi: u32) -> u32 {
@@ -884,15 +754,15 @@ fn effective_port_map(raw_pi: u32) -> u32 {
         return raw_pi;
     }
 
-    info!("AHCI PI is zero; applying board ports-implemented={board_pi:#010x}");
+    trace!("AHCI PI is zero; applying board ports-implemented={board_pi:#010x}");
     write_reg_u32(REG_PI, board_pi);
 
     let new_pi = read_reg_u32(REG_PI);
     if new_pi == 0 {
-        warn!("AHCI PI write did not latch; probing board port map in software");
+        trace!("AHCI PI write did not latch; probing board port map in software");
         board_pi
     } else {
-        info!("AHCI PI after board port map write: {new_pi:#010x}");
+        trace!("AHCI PI after board port map write: {new_pi:#010x}");
         new_pi
     }
 }
@@ -970,29 +840,11 @@ impl AhciPort {
             if start_command_engine(port, &ptrs)
                 && let Some(capacity_blocks) = identify_device(port, &ptrs)
             {
-                self.probe_polling_read(&ptrs);
                 block = Some(AhciBlock::new(*self, capacity_blocks));
             }
         }
         log_port(port, "after-link");
         block
-    }
-
-    fn read_blocks(&self, ptrs: &DmaPtrs, lba: u64, buf: &mut [u8]) -> Result<(), AhciError> {
-        if !buf.len().is_multiple_of(AHCI_SECTOR_SIZE) {
-            return Err(AhciError::InvalidBufferSize);
-        }
-
-        let mut sector_offset = 0;
-        for chunk in buf.chunks_mut(AHCI_TRANSFER_BUFFER_SIZE) {
-            let Some(chunk_lba) = lba.checked_add(sector_offset) else {
-                return Err(AhciError::LbaOutOfRange);
-            };
-            self.read_dma(ptrs, chunk_lba, chunk)?;
-            sector_offset += (chunk.len() / AHCI_SECTOR_SIZE) as u64;
-        }
-
-        Ok(())
     }
 
     fn issue_dma_command(
@@ -1007,27 +859,6 @@ impl AhciPort {
             return Err(AhciError::CommandFailed);
         }
 
-        Ok(())
-    }
-
-    fn read_dma(&self, ptrs: &DmaPtrs, lba: u64, buf: &mut [u8]) -> Result<(), AhciError> {
-        let sectors = buf.len() / AHCI_SECTOR_SIZE;
-        let segments = [AhciDmaSegment::new(dma_paddr(ptrs.buffer), buf.len())];
-        self.issue_dma_command(
-            ptrs,
-            AtaDmaCommand {
-                command: ATA_CMD_READ_DMA_EXT,
-                segments: &segments,
-                lba,
-                sectors: sectors as u16,
-                device: ATA_DEVICE_LBA,
-                write: false,
-                label: "READ",
-            },
-        )?;
-
-        let dma_buf = unsafe { core::slice::from_raw_parts(ptrs.buffer as *const u8, buf.len()) };
-        buf.copy_from_slice(dma_buf);
         Ok(())
     }
 
@@ -1137,45 +968,6 @@ impl AhciPort {
 
         trace!("AHCI port{} FLUSH done", self.index);
         Ok(())
-    }
-
-    fn probe_polling_read(&self, ptrs: &DmaPtrs) {
-        let mut sector = [0; AHCI_SECTOR_SIZE];
-        let mut linux_partition = None;
-
-        match self.read_blocks(ptrs, 0, &mut sector) {
-            Ok(()) => {
-                log_sector(0, &sector);
-                log_mbr_partitions(&sector);
-                linux_partition = find_linux_partition(&sector);
-            }
-            Err(err) => warn!("AHCI port{} failed to read LBA0: {:?}", self.index, err),
-        }
-
-        if let Some(partition) = linux_partition {
-            self.probe_ext4_superblock(ptrs, partition);
-        }
-
-        match self.read_blocks(ptrs, 1, &mut sector) {
-            Ok(()) => log_sector(1, &sector),
-            Err(err) => warn!("AHCI port{} failed to read LBA1: {:?}", self.index, err),
-        }
-    }
-
-    fn probe_ext4_superblock(&self, ptrs: &DmaPtrs, partition: MbrPartition) {
-        let mut sector = [0; AHCI_SECTOR_SIZE];
-        let superblock_lba = partition.start_lba as u64 + EXT4_SUPERBLOCK_LBA_OFFSET;
-
-        match self.read_blocks(ptrs, superblock_lba, &mut sector) {
-            Ok(()) => {
-                log_sector(superblock_lba, &sector);
-                log_ext4_superblock(partition, &sector);
-            }
-            Err(err) => warn!(
-                "AHCI port{} failed to read ext4 superblock at LBA {}: {:?}",
-                self.index, superblock_lba, err,
-            ),
-        }
     }
 }
 
