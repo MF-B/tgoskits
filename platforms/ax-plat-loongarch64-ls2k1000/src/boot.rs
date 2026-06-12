@@ -1,6 +1,5 @@
 use ax_page_table_entry::{GenericPTE, MappingFlags, loongarch64::LA64PTE};
 use ax_plat::mem::{Aligned4K, pa, va};
-use loongArch64::register::{stlbps, tlbidx, tlbrehi, tlbrentry};
 
 use crate::{
     config::plat::{BOOT_STACK_SIZE, PHYS_BOOT_OFFSET, PHYS_VIRT_OFFSET},
@@ -82,28 +81,10 @@ fn enable_fp_simd() {
 }
 
 fn init_mmu() {
-    unsafe extern "C" {
-        fn handle_tlb_refill();
-    }
-
-    const PS_4K: usize = 0x0c;
-    const PWCL_VALUE: u32 = 12 | (9 << 5) | (21 << 10) | (9 << 15) | (30 << 20) | (9 << 25);
-    const PWCH_VALUE: u32 = 39 | (9 << 6);
-
-    let root_paddr = ax_plat::mem::virt_to_phys(va!(&raw const BOOT_PT_L0 as usize));
-    let tlbrentry_paddr = pa!(handle_tlb_refill as *const () as usize - PHYS_BOOT_OFFSET);
-
-    tlbidx::set_ps(PS_4K);
-    stlbps::set_ps(PS_4K);
-    tlbrehi::set_ps(PS_4K);
-    tlbrentry::set_tlbrentry(tlbrentry_paddr.as_usize());
-
-    unsafe {
-        ax_cpu::asm::write_pwc(PWCL_VALUE, PWCH_VALUE);
-        ax_cpu::asm::write_kernel_page_table(root_paddr);
-        ax_cpu::asm::write_user_page_table(pa!(0));
-    }
-    ax_cpu::asm::flush_tlb(None);
+    ax_cpu::init::init_mmu(
+        ax_plat::mem::virt_to_phys(va!(&raw const BOOT_PT_L0 as usize)),
+        PHYS_BOOT_OFFSET,
+    );
 }
 
 const BOOT_TO_VIRT: usize = PHYS_VIRT_OFFSET - PHYS_BOOT_OFFSET;
@@ -165,10 +146,6 @@ unsafe extern "C" fn __boot_start() -> ! {
         bl          {init_boot_page_table}
         bl          {init_mmu}
 
-        # Enable paged translation: PLV=0, IE=0, DA=0, PG=1, DATF/DATM=CC.
-        li.w        $t0, 0xb0
-        csrwr       $t0, 0x0
-
         # Adjust stack pointer
         li.d        $t0, {boot_to_virt}
         add.d       $sp, $sp, $t0
@@ -211,10 +188,6 @@ pub(crate) unsafe extern "C" fn _start_secondary() -> ! {
         # Init MMU
         bl          {enable_fp_simd}
         bl          {init_mmu}
-
-        # Enable paged translation: PLV=0, IE=0, DA=0, PG=1, DATF/DATM=CC.
-        li.w        $t0, 0xb0
-        csrwr       $t0, 0x0
 
         # Adjust stack pointer
         li.d        $t0, {boot_to_virt}
