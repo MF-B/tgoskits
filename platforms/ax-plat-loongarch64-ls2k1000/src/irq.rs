@@ -11,6 +11,8 @@ use crate::config::devices::{IPI_IRQ, LIOINTC_IRQ, TIMER_IRQ};
 
 mod liointc;
 
+const LIOINTC_HWIRQ_BASE: usize = 32;
+
 const IOCSR_IPI_SEND_CPU_SHIFT: u32 = 16;
 const IOCSR_IPI_SEND_BLOCKING: u32 = 1 << 31;
 
@@ -58,6 +60,7 @@ impl IrqType {
             TIMER_IRQ => Self::Timer,
             IPI_IRQ => Self::Ipi,
             LIOINTC_IRQ => Self::Io,
+            n if n >= LIOINTC_HWIRQ_BASE => Self::Ex(n - LIOINTC_HWIRQ_BASE),
             n => Self::Ex(n),
         }
     }
@@ -67,7 +70,7 @@ impl IrqType {
             IrqType::Timer => TIMER_IRQ,
             IrqType::Ipi => IPI_IRQ,
             IrqType::Io => LIOINTC_IRQ,
-            IrqType::Ex(n) => *n,
+            IrqType::Ex(n) => *n + LIOINTC_HWIRQ_BASE,
         }
     }
 
@@ -101,7 +104,11 @@ impl IrqIf for IrqIfImpl {
                     liointc::disable_irq(irq)
                 };
                 if !ok {
-                    warn!("External IRQ {irq} is outside the supported LIOINTC range");
+                    warn!(
+                        "External IRQ hwirq{irq} (platform irq {}) is outside the supported \
+                         LIOINTC range",
+                        irq + LIOINTC_HWIRQ_BASE
+                    );
                 }
             }
             _ => {}

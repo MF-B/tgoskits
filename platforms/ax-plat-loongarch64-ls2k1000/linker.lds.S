@@ -109,6 +109,17 @@ SECTIONS
         _ebss = .;
     }
 
+    . = ALIGN(4K);
+    .dma_uncached (NOLOAD) : AT(ADDR(.dma_uncached)) ALIGN(4K) {
+        /*
+         * Driver-owned DMA buffers may be accessed only through uncached DMW
+         * aliases. Keep them outside _sbss.._ebss so clear_bss() does not
+         * create dirty cached aliases for the same physical memory.
+         */
+        KEEP(*(.dma_uncached .dma_uncached.*))
+        . = ALIGN(4K);
+    }
+
     _ekernel = .;
 
     /DISCARD/ : {

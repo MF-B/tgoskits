@@ -69,7 +69,9 @@ pci-ranges = []                                       # [(uint, uint)]
 #     compatible = "ns16550a";
 # };
 uart-paddr = 0x1FE2_0000                 # uint
-uart-irq = 0                            # uint
+# LIOINTC external hwirq numbers are mapped into a separate platform IRQ
+# range by adding 32, avoiding collisions with CPU-local timer/IPI lines.
+uart-irq = 32                           # uint
 uart-clock-frequency = 125_000_000      # uint
 
 # Timer interrupt frequency in Hz.
@@ -95,14 +97,14 @@ liointc-isr-paddr = 0x1FE0_1040         # uint
 liointc-irq = 0x02                      # uint
 
 ahci-paddr = 0x400E_0000                # uint
-ahci-irq = 19                           # uint
+ahci-irq = 51                           # uint
 # Linux DTS uses `ports-implemented = <0x01>` for the LS2K1000 AHCI node.
 ahci-ports-implemented = 0x1            # uint
 
 gmac0-paddr = 0x4004_0000               # uint
-gmac0-irq = 12                          # uint
-gmac0-wake-irq = 13                     # uint
+gmac0-irq = 44                          # uint
+gmac0-wake-irq = 45                     # uint
 
 gmac1-paddr = 0x4005_0000               # uint
-gmac1-irq = 14                          # uint
-gmac1-wake-irq = 15                     # uint
+gmac1-irq = 46                          # uint
+gmac1-wake-irq = 47                     # uint
