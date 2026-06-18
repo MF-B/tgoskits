@@ -104,9 +104,8 @@ jobs:
           FILTER_AXVISOR_LVZ_CONTAINER_PUBLISH: ${{ steps.filter.outputs.axvisor_lvz_container_publish }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          repository="$(printf '%s' "$GITHUB_REPOSITORY" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
-          base_container_image="ghcr.io/${repository}-container"
-          axvisor_lvz_container_image="ghcr.io/${repository}-container-axvisor-lvz"
+          base_container_image="ghcr.io/rcore-os/tgoskits-container"
+          axvisor_lvz_container_image="ghcr.io/rcore-os/tgoskits-container-axvisor-lvz"
           skip_duplicate_push_ci=false
 
           if [ "$EVENT_NAME" = "push" ] \
