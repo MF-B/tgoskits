@@ -136,6 +136,7 @@ members = [
 exclude = [
     "os/StarryOS/lkm/linux-hello",
     "virtualization/test_crates",
+    "vendor/smoltcp-0.13.1",
 ]
 
 [workspace.dependencies]
@@ -284,7 +285,7 @@ cv181x-sdhci = { version = "0.1", path = "drivers/blk/cv181x-sdhci", default-fea
 sdhci-host = { version = "0.5", path = "drivers/blk/sdhci-host", default-features = false }
 sdmmc-protocol = { version = "0.5", path = "drivers/blk/sdmmc-protocol", default-features = false }
 starfive-jh7110-dwmmc = { version = "0.1", path = "drivers/blk/starfive-jh7110-dwmmc", default-features = false }
-smoltcp = { version = "0.13.1", default-features = false }
+smoltcp = { version = "=0.13.1", default-features = false }
 starry-kernel = { version = "0.12", path = "os/StarryOS/kernel" }
 starry-signal = { version = "0.10", path = "os/StarryOS/signal" }
 starry-vm = { version = "0.6", path = "os/StarryOS/vm" }
@@ -364,3 +365,7 @@ x86 = "0.52"
 x2apic = "0.5.1"
 kmod-tools = "0.3"
 kprobe = "0.6"
+
+[patch.crates-io]
+# RTO/persist fix: https://github.com/smoltcp-rs/smoltcp/commit/bfe5f95404c0f2d0fb26836183869ad7a5d90295
+smoltcp = { path = "vendor/smoltcp-0.13.1" }

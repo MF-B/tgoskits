@@ -2256,3 +2256,316 @@ mod l2_counter_tests {
         assert_eq!(snap.tx_bytes, 120);
     }
 }
+
+#[cfg(all(test, feature = "host-test"))]
+mod tcp_frame_tests {
+    use smoltcp::{
+        iface::{Config, Interface, PollResult, SocketHandle},
+        socket::tcp,
+        time::Duration,
+        wire::{HardwareAddress, TcpSeqNumber},
+    };
+
+    use super::*;
+    use crate::consts::{TCP_RX_BUF_LEN, TCP_TX_BUF_LEN};
+
+    const FRAME_LEN: usize = 921_600;
+    const TAIL_START: usize = FRAME_LEN - 5260;
+    const SENDER_PORT: u16 = 49_500;
+    const RECEIVER_PORT: u16 = 18_944;
+
+    struct FrameLoopback {
+        router: Router,
+        interface: Interface,
+        sockets: SocketSet<'static>,
+        sender: SocketHandle,
+        receiver: SocketHandle,
+        next_seq: Option<TcpSeqNumber>,
+        sent: usize,
+        last_data_at: Instant,
+        zero_update: Option<(TcpSeqNumber, TcpSeqNumber)>,
+        reopened_at: Option<Instant>,
+        receiver_acks: VecDeque<(Instant, TcpSeqNumber, TcpSeqNumber, u16)>,
+        reopened_data: Vec<(Instant, TcpSeqNumber, TcpSeqNumber, usize)>,
+    }
+
+    impl FrameLoopback {
+        fn new(now: Instant, ack_delay: Option<Duration>, nagle: bool) -> Self {
+            let mut router = Router::new(Arc::new(RawSpinRwLock::new(RouteTable::new())));
+            let mut interfaces = Vec::new();
+            // Use the actual loopback route, MTU, queue capacities, and socket
+            // buffer constants. Only the clock and application schedule vary.
+            let address = crate::register_loopback(&mut router, &mut interfaces).address();
+            let mut interface =
+                Interface::new(Config::new(HardwareAddress::Ip), &mut router, now);
+            interface.update_ip_addrs(|addresses| {
+                addresses.push(IpCidr::new(IpAddress::Ipv4(address), 8)).unwrap();
+            });
+            let mut sockets = SocketSet::new(vec![]);
+            let make_socket = || {
+                let mut socket = tcp::Socket::new(
+                    tcp::SocketBuffer::new(vec![0; TCP_RX_BUF_LEN]),
+                    tcp::SocketBuffer::new(vec![0; TCP_TX_BUF_LEN]),
+                );
+                socket.set_ack_delay(ack_delay);
+                socket.set_nagle_enabled(nagle);
+                socket
+            };
+            let mut receiver = make_socket();
+            receiver.listen((address, RECEIVER_PORT)).unwrap();
+            let receiver = sockets.add(receiver);
+            let mut sender = make_socket();
+            sender
+                .connect(interface.context(), (address, RECEIVER_PORT), SENDER_PORT)
+                .unwrap();
+            let sender = sockets.add(sender);
+            Self {
+                router,
+                interface,
+                sockets,
+                sender,
+                receiver,
+                next_seq: None,
+                sent: 0,
+                last_data_at: now,
+                zero_update: None,
+                reopened_at: None,
+                receiver_acks: VecDeque::new(),
+                reopened_data: Vec::new(),
+            }
+        }
+
+        fn poll(&mut self, now: Instant) -> bool {
+            // This is Service::poll's loopback order: fully poll smoltcp, then
+            // dispatch the bounded TX queue back into the real RX queue.
+            let changed = self.interface.poll(now, &mut self.router, &mut self.sockets)
+                == PollResult::SocketStateChanged;
+            for offset in 0..self.router.tx_buffer.len() {
+                let bytes = self.router.tx_buffer.get_allocated(offset, 1)[0].as_bytes();
+                let ip = Ipv4Packet::new_checked(bytes).unwrap();
+                let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+                assert!(ip.verify_checksum(), "invalid loopback IPv4 checksum at {now:?}");
+                assert!(
+                    tcp.verify_checksum(&ip.src_addr().into(), &ip.dst_addr().into()),
+                    "invalid loopback TCP checksum at {now:?}: seq={} ack={} len={}",
+                    tcp.seq_number(),
+                    tcp.ack_number(),
+                    tcp.payload().len(),
+                );
+                assert!(bytes.len() <= STANDARD_MTU);
+                assert!(tcp.payload().len() <= STANDARD_MTU - 40);
+                if tcp.src_port() == SENDER_PORT && !tcp.payload().is_empty() {
+                    if self.reopened_at.is_some() && self.reopened_data.len() < 8 {
+                        self.reopened_data.push((
+                            now,
+                            tcp.seq_number(),
+                            tcp.ack_number(),
+                            tcp.payload().len(),
+                        ));
+                    }
+                    if let Some(next_seq) = self.next_seq {
+                        assert_eq!(
+                            tcp.seq_number(),
+                            next_seq,
+                            "unexpected retransmission at {now:?}: sent={} tail={} zero={:?} reopen={:?} receiver_acks={:?} rx_queue={} reopened_data={:?}",
+                            self.sent,
+                            FRAME_LEN - self.sent,
+                            self.zero_update,
+                            self.reopened_at,
+                            self.receiver_acks,
+                            self.sockets.get::<tcp::Socket>(self.receiver).recv_queue(),
+                            self.reopened_data,
+                        );
+                    }
+                    for (offset, byte) in tcp.payload().iter().enumerate() {
+                        assert_eq!(
+                            *byte,
+                            ((self.sent + offset) % 251) as u8,
+                            "loopback payload changed at {}",
+                            self.sent + offset,
+                        );
+                    }
+                    self.next_seq = Some(tcp.seq_number() + tcp.payload().len());
+                    self.sent += tcp.payload().len();
+                    self.last_data_at = now;
+                }
+                if tcp.src_port() == RECEIVER_PORT && tcp.ack() && !tcp.syn() {
+                    if self.receiver_acks.len() == 8 {
+                        self.receiver_acks.pop_front();
+                    }
+                    self.receiver_acks.push_back((
+                        now,
+                        tcp.seq_number(),
+                        tcp.ack_number(),
+                        tcp.window_len(),
+                    ));
+                    if tcp.window_len() == 0 && self.zero_update.is_none() {
+                        self.zero_update = Some((tcp.seq_number(), tcp.ack_number()));
+                    } else if tcp.window_len() > 0 && self.reopened_at.is_none() {
+                        if let Some(zero) = self.zero_update {
+                            assert_eq!(
+                                (tcp.seq_number(), tcp.ack_number()),
+                                zero,
+                                "immediate reopening must preserve the window-update SEQ/ACK"
+                            );
+                            self.reopened_at = Some(now);
+                        }
+                    }
+                }
+            }
+            let dispatched = self.router.dispatch(now, &mut self.sockets);
+            let stats = self.router.devices[0].as_ref().unwrap().stats();
+            assert_eq!(
+                stats.rx_dropped,
+                0,
+                "natural loopback loss at {now:?}: sent={} tail={} rx_bytes={} tx_packets={}",
+                self.sent,
+                FRAME_LEN - self.sent,
+                self.router.rx_buffer.payload_bytes_count(),
+                stats.tx_packets,
+            );
+            changed || dispatched
+        }
+    }
+
+    #[test]
+    fn frame_loopback_reopens_window_without_a_one_second_tail() {
+        let frame: Vec<u8> = (0..FRAME_LEN).map(|offset| (offset % 251) as u8).collect();
+        let batches = [
+            (FRAME_LEN, TCP_RX_BUF_LEN, 1),
+            (1460, 1460, 1),
+            (5260, 64 * 1024, 4),
+            (64 * 1024, 5260, SOCKET_BUFFER_SIZE),
+        ];
+        for (write_batch, read_batch, poll_batch) in batches {
+            for tick_us in [1, 1000] {
+                for ack_delay in [None, Some(Duration::from_millis(10))] {
+                    for nagle in [false, true] {
+                        let case = (
+                            write_batch,
+                            read_batch,
+                            poll_batch,
+                            tick_us,
+                            ack_delay,
+                            nagle,
+                        );
+                        let mut now = if tick_us == 1 {
+                            Instant::from_micros(123_456_789)
+                        } else {
+                            Instant::from_millis(123_456)
+                        };
+                        let start = now;
+                        let mut stream = FrameLoopback::new(now, ack_delay, nagle);
+                        for _ in 0..16 {
+                            stream.poll(now);
+                            if stream.sockets.get::<tcp::Socket>(stream.sender).state()
+                                == tcp::State::Established
+                                && stream.sockets.get::<tcp::Socket>(stream.receiver).state()
+                                    == tcp::State::Established
+                            {
+                                break;
+                            }
+                        }
+                        assert_eq!(
+                            stream.sockets.get::<tcp::Socket>(stream.sender).state(),
+                            tcp::State::Established,
+                            "loopback handshake failed: {case:?}"
+                        );
+                        let mut queued = 0;
+                        let mut consumed = 0;
+                        let mut reading = false;
+                        while consumed != FRAME_LEN
+                            || stream.sockets.get::<tcp::Socket>(stream.sender).send_queue() != 0
+                        {
+                            assert!(
+                                now - start < Duration::from_secs(1),
+                                "frame stalled: {case:?} queued={queued} consumed={consumed} tail={} \
+                                 sent={} rx_queue={} tx_queue={} next_poll={:?}",
+                                FRAME_LEN - consumed,
+                                stream.sent,
+                                stream.sockets.get::<tcp::Socket>(stream.receiver).recv_queue(),
+                                stream.sockets.get::<tcp::Socket>(stream.sender).send_queue(),
+                                stream.interface.poll_at(now, &stream.sockets),
+                            );
+                            let mut progress = false;
+                            if queued != FRAME_LEN {
+                                let end = (queued + write_batch).min(FRAME_LEN);
+                                let count = stream
+                                    .sockets
+                                    .get_mut::<tcp::Socket>(stream.sender)
+                                    .send_slice(&frame[queued..end])
+                                    .unwrap();
+                                queued += count;
+                                progress |= count != 0;
+                            }
+                            for _ in 0..poll_batch {
+                                progress |= stream.poll(now);
+                                if !reading && stream.zero_update.is_some() {
+                                    break;
+                                }
+                            }
+                            let opening = !reading && stream.zero_update.is_some();
+                            let receiver = stream.sockets.get_mut::<tcp::Socket>(stream.receiver);
+                            if (reading || opening) && receiver.can_recv() {
+                                let count = receiver
+                                    .recv(|bytes| {
+                                        let boundary = if consumed < TAIL_START {
+                                            TAIL_START
+                                        } else {
+                                            FRAME_LEN
+                                        };
+                                        let count = read_batch
+                                            .min(bytes.len())
+                                            .min(boundary - consumed);
+                                        assert_eq!(
+                                            &bytes[..count],
+                                            &frame[consumed..consumed + count]
+                                        );
+                                        (count, count)
+                                    })
+                                    .unwrap();
+                                consumed += count;
+                                progress |= count != 0;
+                                if opening {
+                                    stream.poll(now);
+                                    assert_eq!(
+                                        stream.reopened_at,
+                                        Some(now),
+                                        "window update waited for a timer: {case:?}"
+                                    );
+                                    stream.poll(now);
+                                    reading = true;
+                                }
+                            }
+                            if stream.sent != FRAME_LEN {
+                                assert!(
+                                    now - stream.last_data_at
+                                        <= Duration::from_millis(20)
+                                            + Duration::from_micros(2 * tick_us),
+                                    "data stalled: {case:?} tail={} next_poll={:?}",
+                                    FRAME_LEN - consumed,
+                                    stream.interface.poll_at(now, &stream.sockets),
+                                );
+                            }
+                            let next_tick = now + Duration::from_micros(tick_us);
+                            now = if progress {
+                                next_tick
+                            } else {
+                                stream
+                                    .interface
+                                    .poll_at(now, &stream.sockets)
+                                    .unwrap_or(next_tick)
+                                    .max(next_tick)
+                            };
+                        }
+                        assert!(
+                            reading,
+                            "the scenario did not exhaust the window: {case:?}"
+                        );
+                        assert_eq!(stream.sent, FRAME_LEN);
+                    }
+                }
+            }
+        }
+    }
+}

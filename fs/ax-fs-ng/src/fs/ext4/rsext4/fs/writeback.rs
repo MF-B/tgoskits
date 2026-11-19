@@ -117,7 +117,10 @@ impl Ext4Filesystem {
 
     pub(crate) fn sync_to_disk(&self) -> VfsResult<()> {
         let _operation = self.admission.enter().map_err(into_vfs_err)?;
-        self.sync_core(CheckpointPolicy::LogPressure)
+        // Explicit sync must publish metadata to its home blocks, so readers
+        // without journal replay (including U-Boot extlinux) see the result.
+        // Periodic writeback retains its separate LogPressure policy.
+        self.sync_core(CheckpointPolicy::Drain)
             .map_err(into_vfs_err)
     }
 

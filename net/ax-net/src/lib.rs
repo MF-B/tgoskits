@@ -159,6 +159,12 @@ static QUEUE_RUNTIME: OnceLock<Mutex<Option<NetworkQueueRuntime>>> = OnceLock::n
 static WIFI_INTERFACES: OnceLock<Vec<WifiInterfaceControl>> = OnceLock::new();
 static WIFI_ENTROPY: OnceLock<Mutex<WifiEntropy>> = OnceLock::new();
 static PROTOCOL_POLL: ProtocolPollRuntime = ProtocolPollRuntime::new();
+#[cfg(test)]
+std::thread_local! {
+    // Let socket tests finish a protocol cycle before the socket lock is taken.
+    static POLL_REQUEST_HOOK: core::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { core::cell::RefCell::new(None) };
+}
 static SHUTDOWN_STARTED: AtomicBool = AtomicBool::new(false);
 static PROTOCOL_EXECUTOR: Mutex<Option<ax_task::thread::ThreadHandle>> = Mutex::new(None);
 static PROTOCOL_AFFINITY_STATUS: AtomicU8 = AtomicU8::new(0);
@@ -761,6 +767,12 @@ fn poll_protocol_until_idle(budget: &mut ProtocolPollBudget) {
 /// This is the lightweight entry used by socket and device paths.
 pub fn request_poll() {
     let _ = PROTOCOL_POLL.request();
+    #[cfg(test)]
+    POLL_REQUEST_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook();
+        }
+    });
 }
 
 /// Waits for the unique protocol executor to dispatch all work published by

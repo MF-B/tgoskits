@@ -650,7 +650,8 @@ impl SocketOps for TcpSocket {
             return Err(NetError::NotConnected);
         }
         request_poll();
-        self.with_smol_socket(|socket| {
+        let mut total = 0;
+        let result = self.with_smol_socket(|socket| {
             if socket.recv_queue() > 0 {
                 if options.flags.contains(RecvFlags::PEEK) {
                     dst.write(
@@ -664,7 +665,6 @@ impl SocketOps for TcpSocket {
                     // This loop copies across smoltcp's internal buffer segments to fill
                     // the user buffer with as many bytes as are ready, but does not block
                     // waiting for more data to arrive.
-                    let mut total = 0;
                     while socket.recv_queue() > 0 && dst.remaining_mut() > 0 {
                         let len = socket
                             .recv(|buf| {
@@ -692,7 +692,15 @@ impl SocketOps for TcpSocket {
             } else {
                 Err(NetError::WouldBlock)
             }
-        })
+        });
+        if total > 0 {
+            // Consuming RX space can reopen the advertised TCP window. The
+            // entry request may already have completed on the protocol CPU,
+            // so publish this mutation after releasing the socket-set lock.
+            // Keep this notification even if a later buffer write failed.
+            request_poll();
+        }
+        result
     }
 
     fn recv_available(&self) -> NetResult<usize> {
@@ -1167,7 +1175,111 @@ fn get_ephemeral_port() -> NetResult<u16> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::boxed::Box;
+
+    use smoltcp::{
+        iface::{Config, Interface, PollIngressSingleResult, PollResult},
+        phy::{Loopback, Medium},
+        time::Instant,
+        wire::{HardwareAddress, IpCidr, Ipv4Address},
+    };
+
     use super::*;
+
+    struct TcpPair([TcpSocket; 2]);
+
+    impl Drop for TcpPair {
+        fn drop(&mut self) {
+            for socket in &self.0 {
+                socket.with_smol_socket(|socket| socket.abort());
+            }
+        }
+    }
+
+    struct PollRequestHook;
+
+    impl Drop for PollRequestHook {
+        fn drop(&mut self) {
+            crate::POLL_REQUEST_HOOK.with(|hook| *hook.borrow_mut() = None);
+        }
+    }
+
+    fn poll_tcp_pair(interface: &mut Interface, device: &mut Loopback, now: Instant) {
+        let mut sockets = SOCKET_SET.inner.lock();
+        for _ in 0..32 {
+            let ingress = interface.poll_ingress_single(now, device, &mut sockets);
+            let egress = interface.poll_egress(now, device, &mut sockets);
+            if ingress == PollIngressSingleResult::None && egress == PollResult::None {
+                return;
+            }
+        }
+        panic!("TCP pair did not become idle");
+    }
+
+    #[test]
+    fn consuming_receive_window_publishes_progress_after_an_early_poll() {
+        let pair = TcpPair([TcpSocket::new(), TcpSocket::new()]);
+        let [receiver, sender] = &pair.0;
+        for socket in &pair.0 {
+            socket.with_smol_socket(|socket| {
+                *socket = smol::Socket::new(
+                    smol::SocketBuffer::new(vec![0; 32]),
+                    smol::SocketBuffer::new(vec![0; 64]),
+                );
+                socket.set_nagle_enabled(false);
+                socket.set_ack_delay(None);
+            });
+        }
+
+        let now = Instant::from_millis(0);
+        let address = Ipv4Address::new(127, 0, 0, 1);
+        let mut device = Loopback::new(Medium::Ip);
+        let mut interface = Interface::new(Config::new(HardwareAddress::Ip), &mut device, now);
+        interface.update_ip_addrs(|addrs| addrs.push(IpCidr::new(address.into(), 8)).unwrap());
+        receiver.with_smol_socket(|socket| socket.listen((address, 32100)).unwrap());
+        sender.with_smol_socket(|socket| {
+            socket
+                .connect(interface.context(), (address, 32100), 32101)
+                .unwrap();
+        });
+        poll_tcp_pair(&mut interface, &mut device, now);
+        receiver.state.set(State::Connected);
+        sender.with_smol_socket(|socket| assert_eq!(socket.send_slice(&[0x5a; 40]), Ok(40)));
+        poll_tcp_pair(&mut interface, &mut device, now);
+        assert_eq!(receiver.with_smol_socket(|socket| socket.recv_queue()), 32);
+        assert_eq!(sender.with_smol_socket(|socket| socket.send_queue()), 8);
+
+        // Finish every requested generation synchronously. In particular, the
+        // request at try_recv entry is fully consumed before it frees RX space.
+        // Keep protocol time fixed so neither retransmit nor persist can help.
+        let runtime = crate::poll_runtime::ProtocolPollRuntime::new();
+        crate::POLL_REQUEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let generation = runtime.request();
+                poll_tcp_pair(&mut interface, &mut device, now);
+                runtime.complete(generation);
+                assert!(!runtime.finish_cycle(|| false));
+            }));
+        });
+        let _hook = PollRequestHook;
+
+        let mut data = [0; 32];
+        assert_eq!(
+            receiver.try_recv(&mut data[..], &mut RecvOptions::default()),
+            Ok(32)
+        );
+        assert_eq!(data, [0x5a; 32]);
+        // No subsequent recv or timer tick may be required to advertise space
+        // and let the peer deliver the bytes held behind the closed window.
+        assert_eq!(receiver.with_smol_socket(|socket| socket.recv_queue()), 8);
+        assert_eq!(sender.with_smol_socket(|socket| socket.send_queue()), 0);
+        let mut tail = [0; 8];
+        assert_eq!(
+            receiver.try_recv(&mut tail[..], &mut RecvOptions::default()),
+            Ok(8)
+        );
+        assert_eq!(tail, [0x5a; 8]);
+    }
 
     #[test]
     fn half_shutdown_keeps_connected_public_state() {

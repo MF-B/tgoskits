@@ -44,7 +44,8 @@ pub struct GemBufferInfo {
 
 // These are resource policy limits, not RK3588 hardware limits. Charge full
 // pages, and leave room for other users of the shared contiguous DMA allocator.
-const MAX_ALLOCATION_BYTES: usize = 64 * 1024 * 1024;
+// magic_detect event FP16 graph requests a 75,366,400-byte contiguous buffer.
+const MAX_ALLOCATION_BYTES: usize = 128 * 1024 * 1024;
 const MAX_OWNER_BYTES: usize = 256 * 1024 * 1024;
 const MAX_OWNER_OBJECTS: usize = 1024;
 const MAX_DEVICE_BYTES: usize = 512 * 1024 * 1024;

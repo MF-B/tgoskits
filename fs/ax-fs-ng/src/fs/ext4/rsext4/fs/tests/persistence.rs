@@ -112,6 +112,67 @@ fn mount_background(
 }
 
 #[test]
+fn explicit_sync_checkpoints_extlinux_rename_without_journal_replay() {
+    for sync_file in [false, true] {
+        let (storage, flushes) = formatted_test_storage();
+        let (filesystem, root) = mount_background(storage.clone(), flushes);
+        let boot = root
+            .create("boot", NodeType::Directory, NodePermission::default(), 0, 0)
+            .unwrap();
+        let extlinux = boot
+            .create("extlinux", NodeType::Directory, NodePermission::default(), 0, 0)
+            .unwrap();
+        let old = extlinux
+            .create("extlinux.conf", NodeType::RegularFile, NodePermission::default(), 0, 0)
+            .unwrap();
+        old.entry().as_file().unwrap().write_at(&[b'o'; 807], 0).unwrap();
+        // Establish the old home-block image before replacing its directory entry.
+        filesystem.sync_core(super::super::writeback::CheckpointPolicy::Drain).unwrap();
+        let replacement = extlinux
+            .create("extlinux.conf.new", NodeType::RegularFile, NodePermission::default(), 0, 0)
+            .unwrap();
+        let new_config = [b'n'; 806];
+        replacement.entry().as_file().unwrap().write_at(&new_config, 0).unwrap();
+        extlinux.rename("extlinux.conf.new", &extlinux, "extlinux.conf").unwrap();
+        if sync_file {
+            replacement.sync(false).unwrap();
+        } else {
+            // sys_sync uses the root VFS sync path.
+            root.sync(false).unwrap();
+        }
+
+        // Snapshot while the original mount is alive: shutdown/drop must not
+        // rescue a journal-only commit. A new device/cache reads home blocks
+        // with replay explicitly disabled, matching the bootloader boundary.
+        let snapshot = Arc::new(StdMutex::new(storage.lock().unwrap().clone()));
+        let disk = Ext4Disk::new(
+            Box::new(SharedMemoryDevice {
+                storage: snapshot,
+                read_only: true,
+                flushes: Arc::new(AtomicUsize::new(0)),
+            }),
+            BlockRegion::from_num_blocks((TEST_DEVICE_BYTES / TEST_SECTOR_BYTES) as u64),
+        ).unwrap();
+        let services = MountServices::new(Ext4Clock, Ext4Entropy, Ext4Observer);
+        let mut boot_reader = rsext4::Ext4::mount(
+            disk,
+            services,
+            rsext4::MountOptions::read_only_no_journal_replay(),
+        ).unwrap();
+        let mut parent = boot_reader.root_inode();
+        for name in [b"boot".as_slice(), b"extlinux", b"extlinux.conf"] {
+            parent = boot_reader.lookup_child_number(
+                parent, rsext4::FileName::new(name).unwrap(),
+            ).unwrap().expect("renamed boot configuration must be in home blocks");
+        }
+        assert_eq!(boot_reader.inode(parent).unwrap().size, 806);
+        let mut actual = [0; 807];
+        assert_eq!(boot_reader.read_inode(parent, 0, &mut actual).unwrap(), 806);
+        assert_eq!(&actual[..806], &new_config);
+    }
+}
+
+#[test]
 fn boot_directory_exchange_replaces_assets_and_preserves_open_old_files() {
     crate::os::memory::test_support::with_test_page_provider(true, |_| {
         use axfs_ng_vfs::{Mountpoint, MutationCredentials, NodePermission};
