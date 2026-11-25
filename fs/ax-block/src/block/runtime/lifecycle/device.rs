@@ -395,14 +395,14 @@ impl DeviceInner {
     }
 
     pub(super) fn wait_until_ready(&self, timeout: Duration) -> Result<(), BlkError> {
-        let deadline = wall_time().saturating_add(timeout);
+        let deadline = monotonic_time().saturating_add(timeout);
         loop {
             match self.state.load(Ordering::Acquire) {
                 DEVICE_READY => return Ok(()),
                 DEVICE_FAILED | DEVICE_STOPPED => return Err(BlkError::Io),
                 _ => {}
             }
-            let now = wall_time();
+            let now = monotonic_time();
             if now >= deadline {
                 self.mark_failed();
                 return Err(BlkError::Io);

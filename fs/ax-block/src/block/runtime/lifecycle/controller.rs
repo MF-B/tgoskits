@@ -283,7 +283,7 @@ pub(super) fn run_controller(
             }
         }
 
-        let now = wall_time();
+        let now = monotonic_time();
         if let Some(current) = &pending {
             if now >= current.deadline {
                 let exit = current.exit_on_complete;
@@ -354,7 +354,7 @@ pub(super) fn run_controller(
             }
             match &pending {
                 Some(current) => {
-                    let now = wall_time();
+                    let now = monotonic_time();
                     let wake_at = current.retry_at.min(current.deadline);
                     if wake_at > now {
                         port.notification.wait_timeout(wake_at - now);
@@ -430,7 +430,7 @@ fn schedule_pending(
     event: ControllerEvent,
     exit_on_complete: bool,
 ) {
-    let now = wall_time();
+    let now = monotonic_time();
     let retry_after = nonzero_retry_delay(retry_after);
     *pending = Some(PendingTransition {
         retry_at: now.saturating_add(retry_after),
@@ -446,7 +446,7 @@ fn reschedule_pending(
     mut current: PendingTransition,
     retry_after: Duration,
 ) {
-    current.retry_at = wall_time().saturating_add(nonzero_retry_delay(retry_after));
+    current.retry_at = monotonic_time().saturating_add(nonzero_retry_delay(retry_after));
     *pending = Some(current);
 }
 

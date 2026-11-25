@@ -54,8 +54,8 @@ use super::{
 use crate::{
     BlockError, BlockResult,
     os::{
-        BlockIrqRegistration, BlockNotification, BlockThread, register_block_irq, runtime_ops,
-        sync::RawSpinLock, wall_time,
+        BlockIrqRegistration, BlockNotification, BlockThread, monotonic_time, register_block_irq,
+        runtime_ops, sync::RawSpinLock,
     },
 };
 
@@ -755,7 +755,7 @@ fn start_group_controller(
     let mut members = Vec::new();
     let mut endpoints = Vec::new();
     let mut event = GroupControllerEvent::Start;
-    let deadline = wall_time().saturating_add(timeout);
+    let deadline = monotonic_time().saturating_add(timeout);
     loop {
         let mut update = controller.advance(event)?;
         members.extend(update.take_members());
@@ -778,7 +778,7 @@ fn drive_group_transition(
     mut event: GroupControllerEvent,
     timeout: Duration,
 ) -> Result<ControllerState, BlkError> {
-    let deadline = wall_time().saturating_add(timeout);
+    let deadline = monotonic_time().saturating_add(timeout);
     loop {
         let update: GroupControllerUpdate = controller.advance(event)?;
         match update.controller_state() {
@@ -792,7 +792,7 @@ fn drive_group_transition(
 }
 
 fn wait_for_group_retry(deadline: Duration, retry_after: Duration) -> Result<(), BlkError> {
-    let now = wall_time();
+    let now = monotonic_time();
     if now >= deadline {
         return Err(BlkError::TimedOut);
     }
@@ -806,7 +806,7 @@ fn wait_for_group_retry(deadline: Duration, retry_after: Duration) -> Result<(),
         .map_err(|_| BlkError::Other("block runtime adapter is not installed"))?
         .notification()
         .wait_timeout(wait);
-    if wall_time() >= deadline {
+    if monotonic_time() >= deadline {
         Err(BlkError::TimedOut)
     } else {
         Ok(())

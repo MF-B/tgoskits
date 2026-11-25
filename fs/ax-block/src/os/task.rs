@@ -124,9 +124,14 @@ pub fn test_wait_timeout_count() -> usize {
     tests::TEST_WAIT_TIMEOUTS.load(Ordering::Relaxed)
 }
 
+#[cfg(test)]
+pub(crate) use tests::{TestWallTimeGuard, before_next_timed_wait, set_test_wall_offset_ns};
+
 #[cfg(any(test, feature = "host-test"))]
 mod tests {
     use alloc::{boxed::Box, string::String, sync::Arc};
+    #[cfg(test)]
+    use core::sync::atomic::AtomicI64;
     use core::{
         sync::atomic::{AtomicUsize, Ordering},
         time::Duration,
@@ -137,6 +142,8 @@ mod tests {
         thread::{self, JoinHandle},
         time::Instant,
     };
+    #[cfg(test)]
+    use std::{cell::RefCell, sync::MutexGuard};
 
     use super::{BlockNotification, BlockRuntimeOps, BlockThread};
     use crate::{BlockResult, os::time::BlockTimeProvider};
@@ -148,6 +155,61 @@ mod tests {
 
     std::thread_local! {
         static TEST_CAN_BLOCK: Cell<bool> = const { Cell::new(true) };
+    }
+
+    #[cfg(test)]
+    static WALL_TIME_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(test)]
+    type TimedWaitHook = Box<dyn FnOnce(&dyn BlockNotification) + Send>;
+
+    #[cfg(test)]
+    std::thread_local! {
+        // Inherited by runtime workers started by this test and their children.
+        static TEST_WALL_OFFSET: RefCell<Option<Arc<AtomicI64>>> = const { RefCell::new(None) };
+        static BEFORE_TIMED_WAIT: RefCell<Option<TimedWaitHook>> = const { RefCell::new(None) };
+    }
+
+    #[cfg(test)]
+    pub(crate) struct TestWallTimeGuard {
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    #[cfg(test)]
+    impl TestWallTimeGuard {
+        pub(crate) fn new() -> Self {
+            let lock = WALL_TIME_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            TEST_WALL_OFFSET.set(Some(Arc::new(AtomicI64::new(0))));
+            Self { _lock: lock }
+        }
+    }
+
+    #[cfg(test)]
+    impl Drop for TestWallTimeGuard {
+        fn drop(&mut self) {
+            set_test_wall_offset_ns(0);
+            TEST_WALL_OFFSET.set(None);
+            BEFORE_TIMED_WAIT.set(None);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_wall_offset_ns(offset: i64) {
+        TEST_WALL_OFFSET.with_borrow(|offset_ns| {
+            offset_ns
+                .as_ref()
+                .expect("wall time test scope")
+                .store(offset, Ordering::Relaxed);
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn before_next_timed_wait(
+        hook: impl FnOnce(&dyn BlockNotification) + Send + 'static,
+    ) {
+        assert!(BEFORE_TIMED_WAIT.replace(Some(Box::new(hook))).is_none());
     }
 
     pub(super) struct TestRuntimeOps;
@@ -213,6 +275,10 @@ mod tests {
                 "block notification wait cannot hold a non-sleeping lock"
             );
             TEST_WAIT_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+            #[cfg(test)]
+            if let Some(hook) = BEFORE_TIMED_WAIT.take() {
+                hook(self);
+            }
             let mut pending = self.pending.lock().unwrap();
             if !*pending {
                 let (next, timeout) = self.ready.wait_timeout(pending, duration).unwrap();
@@ -257,6 +323,16 @@ mod tests {
             _cpu: usize,
             entry: Box<dyn FnOnce() + Send + 'static>,
         ) -> BlockResult<Box<dyn BlockThread>> {
+            #[cfg(test)]
+            let entry = {
+                let offset = TEST_WALL_OFFSET.with_borrow(Clone::clone);
+                let hook = BEFORE_TIMED_WAIT.take();
+                move || {
+                    TEST_WALL_OFFSET.set(offset);
+                    BEFORE_TIMED_WAIT.set(hook);
+                    entry();
+                }
+            };
             let join = thread::Builder::new().name(name).spawn(entry).unwrap();
             Ok(Box::new(TestThread {
                 join: Mutex::new(Some(join)),
@@ -266,7 +342,21 @@ mod tests {
 
     impl BlockTimeProvider for TestTimeProvider {
         fn wall_time(&self) -> Duration {
-            TEST_START.get_or_init(Instant::now).elapsed()
+            let elapsed = self.monotonic_time();
+            #[cfg(test)]
+            if let Some(offset) = TEST_WALL_OFFSET.with_borrow(|offset_ns| {
+                offset_ns
+                    .as_ref()
+                    .map(|offset| offset.load(Ordering::Relaxed))
+            }) {
+                let adjustment = Duration::from_nanos(offset.unsigned_abs());
+                return if offset < 0 {
+                    elapsed.saturating_sub(adjustment)
+                } else {
+                    elapsed.saturating_add(adjustment)
+                };
+            }
+            elapsed
         }
 
         fn monotonic_time(&self) -> Duration {

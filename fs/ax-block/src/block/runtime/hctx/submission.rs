@@ -107,7 +107,7 @@ pub(super) fn submit_available(
             }
         }
 
-        let deadline = wall_time().saturating_add(REQUEST_TIMEOUT);
+        let deadline = monotonic_time().saturating_add(REQUEST_TIMEOUT);
         let ownership_valid = reconcile_submission_batch(
             &mut context.scratch.requests,
             &mut context.scratch.metadata,

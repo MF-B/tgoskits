@@ -1,4 +1,7 @@
 use super::{resource_rollback::DropTrackedQueue, *};
+use crate::os::task::{TestWallTimeGuard, before_next_timed_wait, set_test_wall_offset_ns};
+
+const HOUR_NS: i64 = 3_600_000_000_000;
 
 struct BlockingGate {
     state: std::sync::Mutex<BlockingGateState>,
@@ -1347,10 +1350,17 @@ fn teardown_releases_queue_when_quiesce_confirms_prior_watchdog_shutdown() {
 }
 
 #[test]
-fn controller_can_register_control_irq_before_creating_an_io_queue() {
+fn controller_can_register_control_irq_and_start_despite_wall_clock_jump() {
     let _registrar_guard = lock_test_irq_registrar();
     crate::os::task::install_test_runtime_ops();
-    crate::os::task::reset_test_wait_timeout_count();
+    let _clock = TestWallTimeGuard::new();
+    let shifted = Arc::new(AtomicBool::new(false));
+    let shifted_hook = Arc::clone(&shifted);
+    before_next_timed_wait(move |notification| {
+        set_test_wall_offset_ns(HOUR_NS);
+        shifted_hook.store(true, Ordering::Release);
+        notification.notify();
+    });
     let log = Arc::new(std::sync::Mutex::new(Vec::new()));
     *TEST_IRQ_REGISTRAR.log.lock().unwrap() = Some(Arc::clone(&log));
     TEST_IRQ_REGISTRAR
@@ -1374,11 +1384,12 @@ fn controller_can_register_control_irq_before_creating_an_io_queue() {
     ))
     .unwrap();
 
-    assert_eq!(register_retries.load(Ordering::Relaxed), 1);
     assert!(
-        crate::os::task::test_wait_timeout_count() >= 1,
+        shifted.load(Ordering::Acquire),
         "register retry must sleep on the runtime notification"
     );
+    assert_eq!(register_retries.load(Ordering::Relaxed), 1);
+    assert_eq!(handle.inner.state.load(Ordering::Acquire), DEVICE_READY);
     assert_eq!(handle.inner.hctxs.lock_irqsave().len(), 1);
     assert_eq!(handle.inner.cpu_channels.lock_irqsave().len(), 1);
     assert_eq!(handle.shutdown(), 1);
@@ -1409,4 +1420,119 @@ fn bootstrap_preserves_waiting_for_irq_controller_without_io_queue() {
     assert_eq!(handle.inner.state.load(Ordering::Acquire), DEVICE_STARTING);
     assert!(handle.inner.hctxs.lock_irqsave().is_empty());
     assert_eq!(handle.shutdown(), 1);
+}
+
+struct IrqReadyController {
+    queue: Option<LifecycleQueue>,
+}
+
+impl DriverGeneric for IrqReadyController {
+    fn name(&self) -> &str {
+        "irq-ready-controller"
+    }
+}
+
+impl BlockController for IrqReadyController {
+    fn device_info(&self) -> DeviceInfo {
+        test_queue_info().device
+    }
+
+    fn max_io_queues(&self) -> usize {
+        1
+    }
+
+    fn advance(&mut self, event: ControllerEvent) -> Result<ControllerUpdate, BlkError> {
+        match event {
+            ControllerEvent::Start { .. } => {
+                Ok(ControllerUpdate::state(ControllerState::WaitingForIrq))
+            }
+            ControllerEvent::Irq(_) => Ok(ControllerUpdate::with_resources(
+                ControllerState::Ready,
+                vec![Box::new(self.queue.take().ok_or(BlkError::Io)?)],
+                Vec::new(),
+            )),
+            ControllerEvent::QuiesceIrqs => Ok(ControllerUpdate::state(ControllerState::Ready)),
+            ControllerEvent::Shutdown => Ok(ControllerUpdate::state(ControllerState::Shutdown)),
+            _ => Err(BlkError::Io),
+        }
+    }
+}
+
+#[test]
+fn device_readiness_wait_survives_wall_clock_jump_forward() {
+    crate::os::task::install_test_runtime_ops();
+    let _clock = TestWallTimeGuard::new();
+    let handle = DeviceRef::bootstrap(
+        String::from("irq-ready"),
+        Vec::new(),
+        Box::new(IrqReadyController {
+            queue: Some(LifecycleQueue {
+                log: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }),
+        }),
+        None,
+        None,
+    )
+    .unwrap();
+    let controller = Arc::clone(&handle.inner.controller);
+    before_next_timed_wait(move |notification| {
+        set_test_wall_offset_ns(HOUR_NS);
+        // Publish the controller event only after the readiness loop rechecks its deadline.
+        before_next_timed_wait(move |_| {
+            controller.post(ControllerEvent::Irq(ControlEvent::new(0, 0)))
+        });
+        notification.notify();
+    });
+
+    assert_eq!(handle.finish_group_start(), Ok(()));
+    assert_eq!(handle.inner.state.load(Ordering::Acquire), DEVICE_READY);
+    assert_eq!(handle.inner.shutdown_result(), Ok(0));
+    assert_eq!(handle.inner.state.load(Ordering::Acquire), DEVICE_STOPPED);
+}
+
+struct RegisterPendingGroup(GroupControllerEvent);
+
+impl DriverGeneric for RegisterPendingGroup {
+    fn name(&self) -> &str {
+        "register-pending-group"
+    }
+}
+
+impl BlockControllerGroup for RegisterPendingGroup {
+    fn advance(&mut self, event: GroupControllerEvent) -> Result<GroupControllerUpdate, BlkError> {
+        match event {
+            GroupControllerEvent::RegisterRetry => {
+                Ok(GroupControllerUpdate::state(ControllerState::Ready))
+            }
+            event if event == self.0 => {
+                set_test_wall_offset_ns(HOUR_NS);
+                Ok(GroupControllerUpdate::state(
+                    ControllerState::RegisterPending {
+                        retry_after: Duration::from_millis(20),
+                    },
+                ))
+            }
+            _ => Err(BlkError::Io),
+        }
+    }
+}
+
+#[test]
+fn group_register_retry_survives_wall_clock_jump_forward() {
+    crate::os::task::install_test_runtime_ops();
+    let _clock = TestWallTimeGuard::new();
+    let start = start_group_controller(
+        &mut RegisterPendingGroup(GroupControllerEvent::Start),
+        CONTROLLER_TRANSITION_TIMEOUT,
+    );
+    set_test_wall_offset_ns(0);
+    let transition = drive_group_transition(
+        &mut RegisterPendingGroup(GroupControllerEvent::QuiesceIrqs),
+        GroupControllerEvent::QuiesceIrqs,
+        CONTROLLER_TRANSITION_TIMEOUT,
+    );
+    assert_eq!(
+        (start.map(|_| ()), transition),
+        (Ok(()), Ok(ControllerState::Ready))
+    );
 }

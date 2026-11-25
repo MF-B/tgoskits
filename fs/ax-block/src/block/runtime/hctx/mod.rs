@@ -25,7 +25,7 @@ use super::{
     completion::CompletionSender,
     irq::{IrqEventLatch, IrqTarget, LatchedIrqEvent},
 };
-use crate::os::{BlockNotification, BlockThread, runtime_ops, sync::RawSpinLock, wall_time};
+use crate::os::{BlockNotification, BlockThread, monotonic_time, runtime_ops, sync::RawSpinLock};
 
 #[cfg(not(test))]
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -603,11 +603,11 @@ fn run_hctx(
             &*queue,
             &mut register_retry_at,
             &mut register_deadline,
-            wall_time(),
+            monotonic_time(),
         );
         let register_progress = advance_register_retry_if_due(
             &mut *queue,
-            wall_time(),
+            monotonic_time(),
             &mut RegisterRetryContext {
                 controller: &*controller,
                 pending: &mut pending,
@@ -644,7 +644,7 @@ fn run_hctx(
         submission_blocked |= submit_progress.queue_full;
         prune_closed_submission_channels(&state);
 
-        if fatal_error.is_none() && pending_deadline_expired(&pending, wall_time()) {
+        if fatal_error.is_none() && pending_deadline_expired(&pending, monotonic_time()) {
             fatal_error = Some(BlkError::TimedOut);
             state.stopping.store(true, Ordering::Release);
         }
@@ -654,7 +654,7 @@ fn run_hctx(
         if irq_progress || register_progress || submit_progress.made_progress {
             continue;
         }
-        let now = wall_time();
+        let now = monotonic_time();
         let wake_at = [
             next_pending_deadline(&pending),
             register_retry_at,
