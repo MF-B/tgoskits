@@ -1,4 +1,7 @@
 use super::*;
+use crate::os::task::{TestWallTimeGuard, before_next_timed_wait, set_test_wall_offset_ns};
+
+const HOUR_NS: i64 = 3_600_000_000_000;
 
 #[test]
 fn negotiated_queue_depth_may_shrink_but_never_grow() {
@@ -276,8 +279,16 @@ fn terminal_irq_drain_failure_does_not_advance_controller_or_rearm() {
 }
 
 #[test]
-fn missing_irq_times_out_without_completion_drain() {
+fn pending_io_times_out_without_irq_after_wall_clock_moves_backward() {
     crate::os::task::install_test_runtime_ops();
+    let _clock = TestWallTimeGuard::new();
+    let shifted = Arc::new(AtomicBool::new(false));
+    let shifted_hook = Arc::clone(&shifted);
+    before_next_timed_wait(move |notification| {
+        set_test_wall_offset_ns(-HOUR_NS);
+        shifted_hook.store(true, Ordering::Release);
+        notification.notify();
+    });
     let counters = Arc::new(QueueCounters::default());
     let observer = Arc::new(TestObserver::default());
     let observer_dyn: Arc<dyn HctxObserver> = observer.clone();
@@ -298,9 +309,18 @@ fn missing_irq_times_out_without_completion_drain() {
     let (subscription, submission) = flush_submission();
     assert!(channel.send(submission, false).is_ok());
 
-    let completed = subscription.recv().unwrap();
-    assert_eq!(completed.result, Err(BlkError::TimedOut));
+    let (completed_tx, completed_rx) = mpsc::channel();
+    let receiver = thread::spawn(move || {
+        let _ = completed_tx.send(subscription.recv().unwrap().result);
+    });
+    let completed = completed_rx.recv_timeout(Duration::from_secs(1));
     hctx.stop().unwrap();
+    receiver.join().unwrap();
+    assert!(
+        shifted.load(Ordering::Acquire),
+        "wall clock must shift backward during the timed wait"
+    );
+    assert_eq!(completed, Ok(Err(BlkError::TimedOut)));
 
     assert!(
         channel.is_closed(),
@@ -316,5 +336,99 @@ fn missing_irq_times_out_without_completion_drain() {
             .unwrap()
             .iter()
             .any(|event| { *event == ControllerEvent::Watchdog { queue_id: 0 } })
+    );
+}
+
+#[test]
+fn pending_io_survives_wall_clock_jump_forward() {
+    crate::os::task::install_test_runtime_ops();
+    let _clock = TestWallTimeGuard::new();
+    let (rechecked_tx, rechecked_rx) = mpsc::channel();
+    before_next_timed_wait(move |notification| {
+        set_test_wall_offset_ns(HOUR_NS);
+        before_next_timed_wait(move |_| {
+            let _ = rechecked_tx.send(());
+        });
+        notification.notify();
+    });
+
+    let counters = Arc::new(QueueCounters::default());
+    let observer: Arc<dyn HctxObserver> = Arc::new(TestObserver::default());
+    let queue = ReverseCompletionQueue {
+        counters: Arc::clone(&counters),
+        next_id: 0,
+        pending: Vec::new(),
+        accept_limit: 2,
+        fatal_after_accept: false,
+        fail_commit: false,
+        inject_unexpected_completion: false,
+    };
+    let hctx = Hctx::start(
+        Box::new(queue),
+        0,
+        Arc::downgrade(&observer),
+        Arc::new(TestControllerPort::default()),
+    )
+    .unwrap();
+    let channel = hctx.add_submission_channel().unwrap();
+    let mut irq = queue_zero_action(&hctx);
+
+    let (subscription, submission) = flush_submission();
+    assert!(channel.send(submission, false).is_ok());
+    wait_for_commits(&counters, 1);
+    let rechecked = rechecked_rx.recv_timeout(Duration::from_secs(1));
+    if rechecked.is_ok() {
+        assert_eq!(irq.run(), crate::os::BlockIrqOutcome::Wake);
+    } else {
+        hctx.stop().unwrap();
+    }
+    assert_eq!(subscription.recv().unwrap().result, Ok(()));
+    rechecked.expect("worker must recheck the pending deadline before the completion IRQ");
+
+    let (subscription, submission) = flush_submission();
+    assert!(channel.send(submission, false).is_ok());
+    wait_for_commits(&counters, 2);
+    assert_eq!(irq.run(), crate::os::BlockIrqOutcome::Wake);
+    assert_eq!(subscription.recv().unwrap().result, Ok(()));
+    hctx.stop().unwrap();
+}
+
+#[test]
+fn hctx_register_retry_survives_wall_clock_jump_forward() {
+    crate::os::task::install_test_runtime_ops();
+    let _clock = TestWallTimeGuard::new();
+    let shifted = Arc::new(AtomicBool::new(false));
+    let shifted_hook = Arc::clone(&shifted);
+    before_next_timed_wait(move |notification| {
+        set_test_wall_offset_ns(HOUR_NS);
+        shifted_hook.store(true, Ordering::Release);
+        notification.notify();
+    });
+    let observer: Arc<dyn HctxObserver> = Arc::new(TestObserver::default());
+    let controller = Arc::new(TestControllerPort::default());
+    let queue = RegisterRetryQueue {
+        retry_after: Some(Duration::from_millis(20)),
+        retries: Arc::new(AtomicUsize::new(0)),
+        drains: Arc::new(AtomicUsize::new(0)),
+    };
+    let hctx = Hctx::start(
+        Box::new(queue),
+        0,
+        Arc::downgrade(&observer),
+        controller.clone(),
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while controller.events.lock().unwrap().is_empty() && Instant::now() < deadline {
+        thread::yield_now();
+    }
+    hctx.stop().unwrap();
+    assert!(
+        shifted.load(Ordering::Acquire),
+        "wall clock must jump forward during the register-retry wait"
+    );
+    assert_eq!(
+        controller.events.lock().unwrap().as_slice(),
+        [ControllerEvent::RegisterRetry]
     );
 }
