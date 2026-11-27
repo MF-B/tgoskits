@@ -168,6 +168,9 @@ pub const IPV4_FRAGMENT_PAYLOAD_ALIGNMENT: usize = 8;
 pub struct PacketMeta {
     #[cfg(feature = "packetmeta-id")]
     pub id: u32,
+    /// Request local echo of an outgoing IPv4 multicast packet by the device.
+    #[cfg(feature = "multicast")]
+    pub multicast_loop: bool,
 }
 
 /// A description of checksum behavior for a particular protocol.

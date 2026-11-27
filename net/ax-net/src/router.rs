@@ -148,6 +148,7 @@ type DevicePacketBuffer = smoltcp::storage::PacketBuffer<'static, InterfaceId>;
 #[derive(Clone)]
 struct TxPacket {
     len: usize,
+    meta: PacketMeta,
     bytes: [u8; STANDARD_MTU],
 }
 
@@ -408,7 +409,11 @@ impl RouteTable {
     ) -> Option<RouteDecision> {
         self.rules
             .iter()
-            .find(|rule| rule.filter.contains_addr(dst) && &rule.src == source)
+            .find(|rule| {
+                &rule.src == source
+                    && (matches!(dst, IpAddress::Ipv4(address) if address.is_multicast())
+                        || rule.filter.contains_addr(dst))
+            })
             .map(|rule| RouteDecision {
                 dev: rule.dev,
                 interface_id: rule.interface_id,
@@ -483,6 +488,8 @@ pub(crate) type SharedRouteTable = Arc<RawSpinRwLock<RouteTable>>;
 pub struct Router {
     rx_buffer: RouterPacketBuffer,
     tx_buffer: RingBuffer<'static, TxPacket>,
+    /// One record per socket membership; duplicates preserve shared joins.
+    ipv4_multicast_memberships: Vec<(Ipv4Address, InterfaceId)>,
     /// Device indices still awaiting the head TX packet. Accepted, permanently
     /// failed and removed ports leave this list before the next retry.
     pending_fanout: Vec<usize>,
@@ -503,6 +510,7 @@ impl Router {
         let tx_buffer = RingBuffer::new(vec![
             TxPacket {
                 len: 0,
+                meta: PacketMeta::default(),
                 bytes: [0; STANDARD_MTU],
             };
             SOCKET_BUFFER_SIZE
@@ -510,6 +518,7 @@ impl Router {
         Self {
             rx_buffer,
             tx_buffer,
+            ipv4_multicast_memberships: Vec::new(),
             pending_fanout: Vec::new(),
             ready_rx: VecDeque::with_capacity(SOCKET_BUFFER_SIZE),
             devices: Vec::new(),
@@ -547,6 +556,8 @@ impl Router {
         let dev = self.device_index_for_interface_id(interface_id)?;
         self.devices[dev] = None;
         self.pending_fanout.retain(|&index| index != dev);
+        self.ipv4_multicast_memberships
+            .retain(|(_, id)| *id != interface_id);
         Some(dev)
     }
 
@@ -573,6 +584,34 @@ impl Router {
             .flatten()
             .map(|device| device.name.clone())
             .collect()
+    }
+
+    pub(crate) fn has_ipv4_multicast_group(&self, group: Ipv4Address) -> bool {
+        self.ipv4_multicast_memberships
+            .iter()
+            .any(|(address, _)| *address == group)
+    }
+
+    pub(crate) fn add_ipv4_multicast_membership(
+        &mut self,
+        group: Ipv4Address,
+        interface_id: InterfaceId,
+    ) {
+        self.ipv4_multicast_memberships.push((group, interface_id));
+    }
+
+    pub(crate) fn remove_ipv4_multicast_membership(
+        &mut self,
+        group: Ipv4Address,
+        interface_id: InterfaceId,
+    ) {
+        if let Some(index) = self
+            .ipv4_multicast_memberships
+            .iter()
+            .position(|entry| *entry == (group, interface_id))
+        {
+            self.ipv4_multicast_memberships.swap_remove(index);
+        }
     }
 
     /// Applies an IPv4 address/gateway update to one device and its routes.
@@ -613,6 +652,15 @@ impl Router {
                 address.address().into(),
                 metric,
             ));
+            // IPv4 multicast is link-local delivery even without a gateway.
+            rules.push(Rule::new(
+                Ipv4Cidr::new(Ipv4Address::new(224, 0, 0, 0), 4).into(),
+                None,
+                dev,
+                interface_id,
+                address.address().into(),
+                metric,
+            ));
             if let Some(gateway) = gateway {
                 rules.push(Rule::new(
                     Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0).into(),
@@ -639,6 +687,7 @@ impl Router {
             rx_buffer,
             ready_rx,
             devices,
+            ipv4_multicast_memberships,
             ..
         } = self;
         for device in devices.iter_mut().flatten() {
@@ -650,12 +699,24 @@ impl Router {
                 let interface_id = device.interface_id;
                 match device.inner.poll_owned_rx(now()) {
                     DeviceRxPoll::Packet(packet) => {
+                        let frame_len = packet.frame_len();
                         let metadata = packet.read_with(|bytes| {
+                            if !accepts_ipv4_multicast(
+                                ipv4_multicast_memberships,
+                                interface_id,
+                                bytes,
+                            ) {
+                                return None;
+                            }
                             snoop_tcp_packet(bytes, sockets);
                             snoop(interface_id, bytes);
-                            rx_metadata(interface_id, bytes)
+                            Some(rx_metadata(interface_id, bytes))
                         });
-                        let frame_len = packet.frame_len();
+                        let Some(metadata) = metadata else {
+                            device.count_rx(frame_len);
+                            budget -= 1;
+                            continue;
+                        };
                         ready_rx.push_back(OwnedRxPacket { metadata, packet });
                         device.count_rx(frame_len);
                         moved_rx = true;
@@ -672,6 +733,13 @@ impl Router {
                 let direct = device.inner.recv_direct(
                     now(),
                     &mut |packet| {
+                        if !accepts_ipv4_multicast(
+                            ipv4_multicast_memberships,
+                            interface_id,
+                            packet,
+                        ) {
+                            return true;
+                        }
                         snoop_tcp_packet(packet, sockets);
                         snoop(interface_id, packet);
                         let Ok(dst) =
@@ -706,6 +774,15 @@ impl Router {
                     device.count_rx_errors(1);
                     break;
                 };
+                if !accepts_ipv4_multicast(
+                    ipv4_multicast_memberships,
+                    interface_id,
+                    packet,
+                ) {
+                    device.count_rx(frame_len);
+                    budget -= 1;
+                    continue;
+                }
                 snoop_tcp_packet(packet, sockets);
                 snoop(interface_id, packet);
                 let Ok(dst) = rx_buffer.enqueue(packet.len(), rx_metadata(interface_id, packet))
@@ -793,9 +870,11 @@ impl Router {
             pending_fanout,
             devices,
             table,
+            ipv4_multicast_memberships,
             ..
         } = self;
         while let Some(packet) = tx_buffer.get_allocated(0, 1).first() {
+            let multicast_loop = packet.meta.multicast_loop;
             let packet = packet.as_bytes();
             let outcome = match IpVersion::of_packet(packet).expect("got invalid IP packet") {
                 IpVersion::Ipv4 => {
@@ -809,6 +888,15 @@ impl Router {
                             pending_fanout,
                             dst_addr,
                             packet.into_inner(),
+                        )
+                    } else if packet.dst_addr().is_multicast() {
+                        dispatch_ipv4_multicast_packet(
+                            rx_buffer,
+                            devices,
+                            table,
+                            ipv4_multicast_memberships,
+                            packet.into_inner(),
+                            multicast_loop,
                         )
                     } else {
                         dispatch_unicast_packet(
@@ -977,6 +1065,69 @@ fn dispatch_unicast_packet(
     }
 }
 
+fn accepts_ipv4_multicast(
+    memberships: &[(Ipv4Address, InterfaceId)],
+    interface_id: InterfaceId,
+    packet: &[u8],
+) -> bool {
+    if IpVersion::of_packet(packet) != Ok(IpVersion::Ipv4) {
+        return true;
+    }
+    let Ok(packet) = Ipv4Packet::new_checked(packet) else {
+        return true;
+    };
+    let group = packet.dst_addr();
+    !group.is_multicast()
+        || group == Ipv4Address::new(224, 0, 0, 1)
+        || memberships.contains(&(group, interface_id))
+}
+
+fn dispatch_ipv4_multicast_packet(
+    rx_buffer: &mut RouterPacketBuffer,
+    devices: &mut [Option<DeviceHandle>],
+    table: &SharedRouteTable,
+    memberships: &[(Ipv4Address, InterfaceId)],
+    bytes: &[u8],
+    multicast_loop: bool,
+) -> DispatchOutcome {
+    let packet = Ipv4Packet::new_checked(bytes).expect("smoltcp emitted an IPv4 packet");
+    let group = packet.dst_addr();
+    let route = table.read().select_route_for_source(
+        &IpAddress::Ipv4(group),
+        &IpAddress::Ipv4(packet.src_addr()),
+    );
+    let Some(route) = route else {
+        debug!("No multicast route for {} to {}", packet.src_addr(), group);
+        return DispatchOutcome::Consumed(false);
+    };
+    let Some(device) = devices.get_mut(route.dev).and_then(Option::as_mut) else {
+        return DispatchOutcome::Consumed(false);
+    };
+    let mut poll_next = false;
+    if packet.hop_limit() != 0 && device.interface_id != InterfaceId::LOOPBACK {
+        match device.try_send(IpAddress::Ipv4(group), bytes, now()) {
+            Ok(sent) => poll_next |= sent,
+            Err(NetDeviceError::Again) => return DispatchOutcome::Retry(false),
+            Err(error) => {
+                warn!("{}: multicast transmit failed: {error:?}", device.name);
+                device.count_tx_errors(1);
+                device.drain_device_counters();
+            }
+        }
+    }
+    // Inject only after the TX packet is consumed so an egress retry cannot
+    // duplicate local delivery. TTL zero still permits host-local multicast.
+    if multicast_loop && memberships.contains(&(group, device.interface_id)) {
+        if let Ok(dst) = rx_buffer.enqueue(bytes.len(), rx_metadata(device.interface_id, bytes)) {
+            dst.copy_from_slice(bytes);
+            poll_next = true;
+        } else {
+            device.count_rx_dropped(1);
+        }
+    }
+    DispatchOutcome::Consumed(poll_next)
+}
+
 /// Injects a loopback packet directly into the smoltcp-facing RX buffer.
 fn inject_loopback_rx_direct(
     rx_buffer: &mut RouterPacketBuffer,
@@ -995,7 +1146,10 @@ fn inject_loopback_rx_direct(
 }
 
 /// smoltcp TX token backed by the router's temporary TX buffer.
-pub struct TxToken<'a>(&'a mut RingBuffer<'static, TxPacket>);
+pub struct TxToken<'a> {
+    buffer: &'a mut RingBuffer<'static, TxPacket>,
+    meta: PacketMeta,
+}
 
 impl smoltcp::phy::TxToken for TxToken<'_> {
     fn consume<R, F>(self, len: usize, f: F) -> R
@@ -1005,14 +1159,19 @@ impl smoltcp::phy::TxToken for TxToken<'_> {
         // receive()/transmit() checked for a free MTU-sized slot. This token's
         // exclusive borrow prevents any intervening enqueue before consume().
         let slot = self
-            .0
+            .buffer
             .enqueue_one()
             .expect("This was checked before creating the TxToken");
         slot.len = len;
+        slot.meta = self.meta;
         let packet = &mut slot.bytes[..len];
         let result = f(packet);
         apply_egress_ip_tos(packet);
         result
+    }
+
+    fn set_meta(&mut self, meta: PacketMeta) {
+        self.meta = meta;
     }
 }
 
@@ -1119,14 +1278,23 @@ impl smoltcp::phy::Device for Router {
                 packet: RxTokenPacket::Owned(packet.packet),
             }
         };
-        Some((rx_token, TxToken(tx_buffer)))
+        Some((
+            rx_token,
+            TxToken {
+                buffer: tx_buffer,
+                meta: PacketMeta::default(),
+            },
+        ))
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
         if self.tx_buffer.is_full() {
             None
         } else {
-            Some(TxToken(&mut self.tx_buffer))
+            Some(TxToken {
+                buffer: &mut self.tx_buffer,
+                meta: PacketMeta::default(),
+            })
         }
     }
 
@@ -2565,6 +2733,156 @@ mod tcp_frame_tests {
                         assert_eq!(stream.sent, FRAME_LEN);
                     }
                 }
+            }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "host-test"))]
+mod ipv4_multicast_tests {
+    use ax_sync::RawSpinLock;
+    use smoltcp::{
+        iface::{Config, Interface, SocketHandle},
+        socket::udp,
+        wire::{HardwareAddress, IpEndpoint},
+    };
+
+    use super::*;
+    use crate::{
+        consts::{UDP_RX_BUF_LEN, UDP_TX_BUF_LEN},
+        device::{EthernetDevice, EthernetFramePort, NetDeviceResult, ProtocolEthernetFrame},
+    };
+
+    #[derive(Default)]
+    struct Wire {
+        frames: VecDeque<ProtocolEthernetFrame>,
+        stalls: usize,
+    }
+
+    struct Port {
+        mac: [u8; 6],
+        rx: Arc<RawSpinLock<Wire>>,
+        tx: Arc<RawSpinLock<Wire>>,
+    }
+
+    impl EthernetFramePort for Port {
+        fn device_name(&self) -> &str {
+            "multicast-test"
+        }
+
+        fn mac_address(&self) -> [u8; 6] {
+            self.mac
+        }
+
+        fn transmit(&mut self, frame: &ProtocolEthernetFrame) -> NetDeviceResult {
+            let mut wire = self.tx.lock_irqsave();
+            if wire.stalls != 0 {
+                wire.stalls -= 1;
+                return Err(NetDeviceError::Again);
+            }
+            wire.frames.push_back(frame.clone());
+            Ok(())
+        }
+
+        fn receive(&mut self) -> NetDeviceResult<ProtocolEthernetFrame> {
+            self.rx
+                .lock_irqsave()
+                .frames
+                .pop_front()
+                .ok_or(NetDeviceError::Again)
+        }
+    }
+
+    struct Endpoint {
+        router: Router,
+        iface: Interface,
+        sockets: SocketSet<'static>,
+    }
+
+    impl Endpoint {
+        fn new(last_octet: u8, rx: Arc<RawSpinLock<Wire>>, tx: Arc<RawSpinLock<Wire>>) -> Self {
+            let id = InterfaceId::new(2);
+            let ip = Ipv4Cidr::new(Ipv4Address::new(10, 0, 0, last_octet), 24);
+            let port = Port { mac: [2, 0, 0, 0, 0, last_octet], rx, tx };
+            let mut router = Router::new(Arc::new(RawSpinRwLock::new(RouteTable::new())));
+            let dev = router.add_device(
+                id,
+                Box::new(EthernetDevice::new(id, "multicast-test".into(), Box::new(port), Some(ip))),
+            );
+            router.set_ipv4_config(dev, id, 0, Some(ip), None);
+            let mut iface = Interface::new(
+                Config::new(HardwareAddress::Ip),
+                &mut router,
+                Instant::ZERO,
+            );
+            iface.update_ip_addrs(|addrs| addrs.push(ip.into()).unwrap());
+            Self { router, iface, sockets: SocketSet::new(vec![]) }
+        }
+
+        fn join(&mut self, group: Ipv4Address) {
+            self.router.add_ipv4_multicast_membership(group, InterfaceId::new(2));
+            self.iface.join_multicast_group(group).unwrap();
+        }
+
+        fn socket(&mut self, port: u16) -> SocketHandle {
+            let mut socket = udp::Socket::new(
+                udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 8], vec![0; UDP_RX_BUF_LEN]),
+                udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 8], vec![0; UDP_TX_BUF_LEN]),
+            );
+            socket.bind(port).unwrap();
+            self.sockets.add(socket)
+        }
+
+        fn poll(&mut self, timestamp: Instant) {
+            self.router.poll(timestamp, &mut self.sockets, |_, _| {});
+            self.iface.poll(timestamp, &mut self.router, &mut self.sockets);
+            self.router.dispatch(timestamp, &mut self.sockets);
+        }
+
+        fn drain(&mut self, handle: SocketHandle, received: &mut Vec<(u16, Vec<u8>)>) {
+            let socket = self.sockets.get_mut::<udp::Socket>(handle);
+            while socket.can_recv() {
+                let (bytes, meta) = socket.recv().unwrap();
+                received.push((meta.endpoint.port, bytes.to_vec()));
+            }
+        }
+    }
+
+    #[test]
+    fn multicast_udp_crosses_ethernet_and_echoes_locally_only_when_enabled() {
+        for multicast_loop in [false, true] {
+            let outbound = Arc::new(RawSpinLock::new(Wire { stalls: 2, ..Wire::default() }));
+            let inbound = Arc::new(RawSpinLock::new(Wire::default()));
+            let mut sender = Endpoint::new(2, Arc::clone(&inbound), Arc::clone(&outbound));
+            let mut receiver = Endpoint::new(3, Arc::clone(&outbound), Arc::clone(&inbound));
+            let group = Ipv4Address::new(239, 1, 2, 3);
+            sender.join(group);
+            receiver.join(group);
+            let sender_port = 49173;
+            let receiver_port = 49971;
+            let send = sender.socket(sender_port);
+            let receive = receiver.socket(receiver_port);
+            let local_echo = sender.socket(receiver_port);
+            let payload = b"multicast UDP";
+            let remote = IpEndpoint::new(group.into(), receiver_port);
+            let socket = sender.sockets.get_mut::<udp::Socket>(send);
+            socket.set_multicast_loop(multicast_loop);
+            socket.send_slice(payload, remote).unwrap();
+
+            let mut received = Vec::new();
+            let mut echoed = Vec::new();
+            for tick in 0..8 {
+                let timestamp = Instant::from_millis(tick);
+                sender.poll(timestamp);
+                receiver.poll(timestamp);
+                sender.drain(local_echo, &mut echoed);
+                receiver.drain(receive, &mut received);
+            }
+            assert_eq!(received, [(sender_port, payload.to_vec())]);
+            if multicast_loop {
+                assert_eq!(echoed, received);
+            } else {
+                assert!(echoed.is_empty());
             }
         }
     }

@@ -1,17 +1,19 @@
 use alloc::vec;
+use core::net::Ipv4Addr;
 
 use ax_net::{
     InterfaceId, SocketOps,
     options::{
-        Configurable, GetSocketOption, SetSocketOption, TcpCongestionControl, TcpInfo,
-        TcpInfoOptions, TcpState,
+        Configurable, GetSocketOption, Ipv4MulticastInterface, Ipv4MulticastMembership,
+        SetSocketOption, TcpCongestionControl, TcpInfo, TcpInfoOptions, TcpState,
     },
 };
 use bytemuck::AnyBitPattern;
 use linux_raw_sys::net::{
-    AF_INET6, IP_TOS, IPPROTO_IPV6, IPV6_RECVTCLASS, IPV6_TCLASS, IPV6_V6ONLY, TCP_CONGESTION,
-    TCP_INFO, TCPI_OPT_ECN, TCPI_OPT_ECN_SEEN, TCPI_OPT_SACK, TCPI_OPT_SYN_DATA,
-    TCPI_OPT_TIMESTAMPS, TCPI_OPT_WSCALE, socklen_t, tcp_info,
+    AF_INET6, IP_ADD_MEMBERSHIP, IP_DROP_MEMBERSHIP, IP_MULTICAST_IF, IP_MULTICAST_LOOP,
+    IP_MULTICAST_TTL, IP_TOS, IPPROTO_IPV6, IPV6_RECVTCLASS, IPV6_TCLASS, IPV6_V6ONLY,
+    TCP_CONGESTION, TCP_INFO, TCPI_OPT_ECN, TCPI_OPT_ECN_SEEN, TCPI_OPT_SACK,
+    TCPI_OPT_SYN_DATA, TCPI_OPT_TIMESTAMPS, TCPI_OPT_WSCALE, socklen_t, tcp_info,
 };
 
 use crate::{
@@ -39,6 +41,57 @@ fn read_int_sockopt(
         return Err(StarryError::InvalidInput);
     }
     optval.cast::<i32>().read(current)
+}
+
+fn read_multicast_int(
+    current: &crate::task::UserTaskRef,
+    optval: UserConstPtr<u8>,
+    optlen: socklen_t,
+) -> StarryResult<i32> {
+    if optlen >= size_of::<i32>() as socklen_t {
+        optval.cast::<i32>().read(current)
+    } else if optlen != 0 {
+        Ok(i32::from(optval.read(current)?))
+    } else {
+        Err(StarryError::InvalidInput)
+    }
+}
+
+fn read_multicast_request(
+    current: &crate::task::UserTaskRef,
+    optval: UserConstPtr<u8>,
+    optlen: socklen_t,
+) -> StarryResult<Ipv4MulticastMembership> {
+    if optlen < 4 {
+        return Err(StarryError::InvalidInput);
+    }
+    // in_addr, ip_mreq and ip_mreqn are distinguished by the supplied length.
+    // Read network-order addresses as bytes, and only the ifindex as native int.
+    let copy_len = if optlen >= 12 { 12 } else if optlen >= 8 { 8 } else { 4 };
+    let bytes = optval.read_slice(current, copy_len)?;
+    let address = |offset: usize| Ipv4Addr::new(
+        bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3],
+    );
+    let index = if copy_len == 12 {
+        i32::from_ne_bytes([bytes[8], bytes[9], bytes[10], bytes[11]])
+    } else {
+        0
+    };
+    Ok(Ipv4MulticastMembership {
+        group: if copy_len >= 8 { address(0) } else { Ipv4Addr::UNSPECIFIED },
+        interface: Ipv4MulticastInterface {
+            address: address(if copy_len >= 8 { 4 } else { 0 }),
+            interface: (index != 0).then_some(InterfaceId::new(index as u32)),
+        },
+    })
+}
+
+fn multicast_option_error(error: ax_net::NetError, missing: Errno) -> StarryError {
+    match error {
+        ax_net::NetError::NoSuchDevice | ax_net::NetError::NoSuchDeviceOrAddress => missing.into(),
+        ax_net::NetError::NoMemory => Errno::ENOBUFS.into(),
+        error => error.into(),
+    }
 }
 
 fn normalize_ip_tos(value: i32) -> u8 {
@@ -525,6 +578,40 @@ pub fn sys_getsockopt(
         return Ok(0);
     }
 
+    if level == PROTO_IP
+        && matches!(optname, IP_MULTICAST_IF | IP_MULTICAST_TTL | IP_MULTICAST_LOOP)
+    {
+        let bytes = match optname {
+            IP_MULTICAST_IF => {
+                let mut interface = Ipv4MulticastInterface::default();
+                socket.get_option(GetSocketOption::Ipv4MulticastInterface(&mut interface))?;
+                interface.address.octets()
+            }
+            IP_MULTICAST_TTL => {
+                let mut ttl = 0;
+                socket.get_option(GetSocketOption::Ipv4MulticastTtl(&mut ttl))?;
+                i32::from(ttl).to_ne_bytes()
+            }
+            _ => {
+                let mut enabled = false;
+                socket.get_option(GetSocketOption::Ipv4MulticastLoop(&mut enabled))?;
+                i32::from(enabled).to_ne_bytes()
+            }
+        };
+        let length = if optname != IP_MULTICAST_IF && optlen > 0 && optlen < 4 {
+            1
+        } else {
+            optlen.min(4)
+        };
+        optlen_ptr.write(current, length)?;
+        if length == 1 && optname != IP_MULTICAST_IF {
+            optval.write(current, i32::from_ne_bytes(bytes) as u8)?;
+        } else if length != 0 {
+            vm_write_slice(current, optval.as_ptr(), &bytes[..length as usize])?;
+        }
+        return Ok(0);
+    }
+
     // IP_PKTINFO / IPV6_RECVPKTINFO / IPV6_PKTINFO are accepted on set (see sys_setsockopt);
     // report them as disabled on get so a probing client sees a coherent value instead of
     // ENOPROTOOPT.
@@ -712,6 +799,46 @@ pub fn sys_setsockopt(
         let tos = normalize_ip_tos(get::<i32>(current, optval, optlen)?);
         socket.set_option(SetSocketOption::IpTos(&tos))?;
         return Ok(0);
+    }
+
+    if level == PROTO_IP {
+        match optname {
+            IP_MULTICAST_IF => {
+                let interface = read_multicast_request(current, optval, optlen)?.interface;
+                socket.set_option(SetSocketOption::Ipv4MulticastInterface(&interface))
+                    .map_err(|error| multicast_option_error(error, Errno::EADDRNOTAVAIL))?;
+                return Ok(0);
+            }
+            IP_MULTICAST_TTL => {
+                let value = read_multicast_int(current, optval, optlen)?;
+                let ttl = match value {
+                    -1 => 1,
+                    0..=255 => value as u8,
+                    _ => return Err(StarryError::InvalidInput),
+                };
+                socket.set_option(SetSocketOption::Ipv4MulticastTtl(&ttl))?;
+                return Ok(0);
+            }
+            IP_MULTICAST_LOOP => {
+                let enabled = read_multicast_int(current, optval, optlen)? != 0;
+                socket.set_option(SetSocketOption::Ipv4MulticastLoop(&enabled))?;
+                return Ok(0);
+            }
+            IP_ADD_MEMBERSHIP | IP_DROP_MEMBERSHIP => {
+                if optlen < 8 {
+                    return Err(StarryError::InvalidInput);
+                }
+                let membership = read_multicast_request(current, optval, optlen)?;
+                let (option, missing) = if optname == IP_ADD_MEMBERSHIP {
+                    (SetSocketOption::AddIpv4Membership(&membership), Errno::ENODEV)
+                } else {
+                    (SetSocketOption::DropIpv4Membership(&membership), Errno::EADDRNOTAVAIL)
+                };
+                socket.set_option(option).map_err(|error| multicast_option_error(error, missing))?;
+                return Ok(0);
+            }
+            _ => {}
+        }
     }
 
     // IP_PKTINFO / IPV6_RECVPKTINFO / IPV6_PKTINFO request ancillary destination-address

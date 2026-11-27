@@ -52,6 +52,8 @@ features = [
   "medium-ip",
   "proto-ipv4",
   "proto-ipv6",
+  "multicast",
+  "iface-max-multicast-group-count-32",
   "auto-icmp-echo-reply",
   "packetmeta-id",
   "socket-raw",

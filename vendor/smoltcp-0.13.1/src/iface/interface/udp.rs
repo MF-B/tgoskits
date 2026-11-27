@@ -24,6 +24,8 @@ impl InterfaceInner {
             &self.caps.checksum
         ));
 
+        let mut handled_by_socket = false;
+
         #[cfg(feature = "socket-udp")]
         for udp_socket in sockets
             .items_mut()
@@ -31,7 +33,10 @@ impl InterfaceInner {
         {
             if udp_socket.accepts(self, &ip_repr, &udp_repr) {
                 udp_socket.process(self, meta, &ip_repr, &udp_repr, udp_packet.payload());
-                return None;
+                if !dst_addr.is_multicast() {
+                    return None;
+                }
+                handled_by_socket = true;
             }
         }
 
@@ -42,8 +47,15 @@ impl InterfaceInner {
         {
             if dns_socket.accepts(&ip_repr, &udp_repr) {
                 dns_socket.process(self, &ip_repr, &udp_repr, udp_packet.payload());
-                return None;
+                if !dst_addr.is_multicast() {
+                    return None;
+                }
+                handled_by_socket = true;
             }
+        }
+
+        if handled_by_socket {
+            return None;
         }
 
         // The packet wasn't handled by a socket, send an ICMP port unreachable packet.

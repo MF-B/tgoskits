@@ -165,7 +165,8 @@ impl EthernetDevice {
             neighbors: HashMap::new(),
             pending_neighbors: HashMap::new(),
             ip,
-            accept_multicast: false,
+            // IP multicast membership is enforced by the router and smoltcp.
+            accept_multicast: true,
 
             pending_packets,
             pending_since: HashMap::new(),
