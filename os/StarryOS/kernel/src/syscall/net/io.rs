@@ -315,10 +315,12 @@ fn recv_impl(
     let mut cmsg = Vec::new();
 
     let mut remote_addr = name.map(|_| SocketAddrEx::Ip((Ipv4Addr::UNSPECIFIED, 0).into()));
+    let mut no_source = false;
     let recv = socket.recv_to_user(
         &mut dst,
         RecvOptions {
             from: remote_addr.as_mut(),
+            no_source: Some(&mut no_source),
             flags: recv_flags,
             cmsg: Some(&mut cmsg),
             truncated: Some(truncated_out),
@@ -327,12 +329,20 @@ fn recv_impl(
 
     let name_len = if let (Some(remote_addr), Some(name)) = (remote_addr, name) {
         let mut len = name.capacity.read(current)?;
-        socket_addr_ex_for_user_name(socket.ip_domain(), remote_addr).write_to_user(
-            current,
-            UserPtr::from(name.addr),
-            &mut len,
-        )?;
-        Some(len)
+        if no_source {
+            // UDP shutdown EOF has no sockaddr, unlike a real empty datagram.
+            if (len as i32) < 0 {
+                return Err(StarryError::InvalidInput);
+            }
+            Some(0)
+        } else {
+            socket_addr_ex_for_user_name(socket.ip_domain(), remote_addr).write_to_user(
+                current,
+                UserPtr::from(name.addr),
+                &mut len,
+            )?;
+            Some(len)
+        }
     } else {
         None
     };
