@@ -24,5 +24,8 @@ mod pm;
 #[cfg(feature = "rockchip-soc")]
 mod pinctrl;
 
+#[cfg(all(target_arch = "aarch64", feature = "rtc"))]
+pub(crate) mod polled_i2c;
+
 #[cfg(feature = "rockchip-soc")]
 pub use pinctrl::{RockchipFdtPinctrlParser, RockchipPinCtrl};
