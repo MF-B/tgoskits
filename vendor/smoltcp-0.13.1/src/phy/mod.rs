@@ -168,6 +168,10 @@ pub const IPV4_FRAGMENT_PAYLOAD_ALIGNMENT: usize = 8;
 pub struct PacketMeta {
     #[cfg(feature = "packetmeta-id")]
     pub id: u32,
+    /// Ingress-link namespace for IPv4 reassembly. Multiplexing devices assign
+    /// distinct values to links; zero is suitable for a single-link device.
+    #[cfg(feature = "proto-ipv4-fragmentation")]
+    pub reassembly_id: u32,
     /// Request local echo of an outgoing IPv4 multicast packet by the device.
     #[cfg(feature = "multicast")]
     pub multicast_loop: bool,
@@ -298,7 +302,7 @@ impl DeviceCapabilities {
     /// Special case method to determine the maximum payload size that is based on the MTU and also aligned per spec.
     #[cfg(feature = "proto-ipv4-fragmentation")]
     pub fn max_ipv4_fragment_size(&self, ip_header_len: usize) -> usize {
-        let payload_mtu = self.ip_mtu() - ip_header_len;
+        let payload_mtu = self.ip_mtu().saturating_sub(ip_header_len);
         payload_mtu - (payload_mtu % IPV4_FRAGMENT_PAYLOAD_ALIGNMENT)
     }
 }

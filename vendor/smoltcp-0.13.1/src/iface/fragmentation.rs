@@ -5,6 +5,7 @@ use core::fmt;
 use managed::{ManagedMap, ManagedSlice};
 
 use crate::config::{FRAGMENTATION_BUFFER_SIZE, REASSEMBLY_BUFFER_COUNT, REASSEMBLY_BUFFER_SIZE};
+use crate::phy::PacketMeta;
 use crate::storage::Assembler;
 use crate::time::{Duration, Instant};
 use crate::wire::*;
@@ -46,9 +47,8 @@ impl std::error::Error for AssemblerFullError {}
 
 /// Holds different fragments of one packet, used for assembling fragmented packets.
 ///
-/// The buffer used for the `PacketAssembler` should either be dynamically sized (ex: Vec<u8>)
-/// or should be statically allocated based upon the MTU of the type of packet being
-/// assembled (ex: 1280 for a IPv6 frame).
+/// Buffers grow lazily with `alloc` and are fixed arrays otherwise. Both modes
+/// enforce `REASSEMBLY_BUFFER_SIZE` as the maximum reassembled payload size.
 #[derive(Debug)]
 pub struct PacketAssembler<K> {
     key: Option<K>,
@@ -57,6 +57,8 @@ pub struct PacketAssembler<K> {
     assembler: Assembler,
     total_size: Option<usize>,
     expires_at: Instant,
+    #[cfg(feature = "proto-ipv4-fragmentation")]
+    pub(crate) ipv4_header: Option<(Ipv4Repr, PacketMeta)>,
 }
 
 impl<K> PacketAssembler<K> {
@@ -73,6 +75,8 @@ impl<K> PacketAssembler<K> {
             assembler: Assembler::new(),
             total_size: None,
             expires_at: Instant::ZERO,
+            #[cfg(feature = "proto-ipv4-fragmentation")]
+            ipv4_header: None,
         }
     }
 
@@ -81,6 +85,31 @@ impl<K> PacketAssembler<K> {
         self.assembler.clear();
         self.total_size = None;
         self.expires_at = Instant::ZERO;
+        #[cfg(feature = "proto-ipv4-fragmentation")]
+        {
+            self.ipv4_header = None;
+        }
+    }
+
+    fn ensure_buffer_len(&mut self, len: usize) -> Result<(), AssemblerError> {
+        if len > REASSEMBLY_BUFFER_SIZE {
+            return Err(AssemblerError);
+        }
+
+        #[cfg(feature = "alloc")]
+        if self.buffer.len() < len {
+            self.buffer
+                .try_reserve_exact(len - self.buffer.len())
+                .map_err(|_| AssemblerError)?;
+            self.buffer.resize(len, 0);
+        }
+
+        #[cfg(not(feature = "alloc"))]
+        if self.buffer.len() < len {
+            return Err(AssemblerError);
+        }
+
+        Ok(())
     }
 
     /// Set the total size of the packet assembler.
@@ -91,15 +120,10 @@ impl<K> PacketAssembler<K> {
             return Err(AssemblerError);
         }
 
-        #[cfg(not(feature = "alloc"))]
-        if self.buffer.len() < size {
+        if self.assembler.iter_data().any(|(_, end)| end > size) {
             return Err(AssemblerError);
         }
-
-        #[cfg(feature = "alloc")]
-        if self.buffer.len() < size {
-            self.buffer.resize(size, 0);
-        }
+        self.ensure_buffer_len(size)?;
 
         self.total_size = Some(size);
         Ok(())
@@ -120,7 +144,10 @@ impl<K> PacketAssembler<K> {
         }
 
         let len = f(&mut self.buffer[offset..])?;
-        assert!(offset + len <= self.buffer.len());
+        let end = offset.checked_add(len).ok_or(AssemblerError)?;
+        if end > self.buffer.len() || self.total_size.is_some_and(|size| end > size) {
+            return Err(AssemblerError);
+        }
 
         net_debug!(
             "frag assembler: receiving {} octets at offset {}",
@@ -128,7 +155,7 @@ impl<K> PacketAssembler<K> {
             offset
         );
 
-        self.assembler.add(offset, len);
+        self.assembler.add(offset, len).map_err(|_| AssemblerError)?;
         Ok(())
     }
 
@@ -139,15 +166,11 @@ impl<K> PacketAssembler<K> {
     /// - Returns [`Error::PacketAssemblerBufferTooSmall`] when trying to add data into the buffer at a non-existing
     ///   place.
     pub(crate) fn add(&mut self, data: &[u8], offset: usize) -> Result<(), AssemblerError> {
-        #[cfg(not(feature = "alloc"))]
-        if self.buffer.len() < offset + data.len() {
+        let end = offset.checked_add(data.len()).ok_or(AssemblerError)?;
+        if self.total_size.is_some_and(|size| end > size) {
             return Err(AssemblerError);
         }
-
-        #[cfg(feature = "alloc")]
-        if self.buffer.len() < offset + data.len() {
-            self.buffer.resize(offset + data.len(), 0);
-        }
+        self.ensure_buffer_len(end)?;
 
         let len = data.len();
         self.buffer[offset..][..len].copy_from_slice(data);
@@ -158,7 +181,7 @@ impl<K> PacketAssembler<K> {
             offset
         );
 
-        self.assembler.add(offset, data.len());
+        self.assembler.add(offset, len).map_err(|_| AssemblerError)?;
         Ok(())
     }
 
@@ -231,7 +254,7 @@ impl<K: Eq + Copy> PacketAssemblerSet<K> {
     /// Remove all [`PacketAssembler`]s that are expired.
     pub fn remove_expired(&mut self, timestamp: Instant) {
         for frag in &mut self.assemblers {
-            if !frag.is_free() && frag.expires_at < timestamp {
+            if !frag.is_free() && frag.expires_at <= timestamp {
                 frag.reset();
             }
         }
@@ -247,7 +270,7 @@ pub(crate) const MAX_DECOMPRESSED_LEN: usize = 1500;
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub(crate) enum FragKey {
     #[cfg(feature = "proto-ipv4-fragmentation")]
-    Ipv4(Ipv4FragKey),
+    Ipv4(Ipv4FragKey, u32),
     #[cfg(feature = "proto-sixlowpan-fragmentation")]
     Sixlowpan(SixlowpanFragKey),
 }
@@ -275,9 +298,12 @@ impl Fragmenter {
 
 #[cfg(feature = "_proto-fragmentation")]
 pub(crate) struct Fragmenter {
-    /// The buffer that holds the unfragmented 6LoWPAN packet.
+    /// The complete IP packet, allocated on the heap when `alloc` is enabled.
+    #[cfg(feature = "alloc")]
+    pub buffer: alloc::vec::Vec<u8>,
+    #[cfg(not(feature = "alloc"))]
     pub buffer: [u8; FRAGMENTATION_BUFFER_SIZE],
-    /// The size of the packet without the IEEE802.15.4 header and the fragmentation headers.
+    /// Complete IPv4 packet length, or unfragmented 6LoWPAN packet length.
     pub packet_len: usize,
     /// The amount of bytes that already have been transmitted.
     pub sent_bytes: usize,
@@ -299,6 +325,8 @@ pub(crate) struct Ipv4Fragmenter {
     pub frag_offset: u16,
     /// The identifier of the stream.
     pub ident: u16,
+    /// Per-datagram metadata retained for every fragment.
+    pub meta: PacketMeta,
 }
 
 #[cfg(feature = "proto-sixlowpan-fragmentation")]
@@ -322,6 +350,9 @@ pub(crate) struct SixlowpanFragmenter {
 impl Fragmenter {
     pub(crate) fn new() -> Self {
         Self {
+            #[cfg(feature = "alloc")]
+            buffer: alloc::vec![0u8; FRAGMENTATION_BUFFER_SIZE],
+            #[cfg(not(feature = "alloc"))]
             buffer: [0u8; FRAGMENTATION_BUFFER_SIZE],
             packet_len: 0,
             sent_bytes: 0,
@@ -339,6 +370,7 @@ impl Fragmenter {
                 dst_hardware_addr: EthernetAddress::default(),
                 frag_offset: 0,
                 ident: 0,
+                meta: PacketMeta::default(),
             },
 
             #[cfg(feature = "proto-sixlowpan-fragmentation")]
@@ -379,6 +411,7 @@ impl Fragmenter {
                 payload_len: 0,
                 hop_limit: 0,
             };
+            self.ipv4.meta = PacketMeta::default();
             #[cfg(feature = "medium-ethernet")]
             {
                 self.ipv4.dst_hardware_addr = EthernetAddress::default();
@@ -451,6 +484,21 @@ mod tests {
     }
 
     #[test]
+    fn packet_assembler_rejects_oversize_and_inconsistent_fragments() {
+        let mut assembler = PacketAssembler::<Key>::new();
+        assert_eq!(assembler.set_total_size(REASSEMBLY_BUFFER_SIZE + 1), Err(AssemblerError));
+        assert_eq!(assembler.add(&[1], REASSEMBLY_BUFFER_SIZE), Err(AssemblerError));
+        assert_eq!(assembler.add(&[1], usize::MAX), Err(AssemblerError));
+
+        assembler.add(&[3, 4], 2).unwrap();
+        assert_eq!(assembler.set_total_size(3), Err(AssemblerError));
+        assembler.set_total_size(4).unwrap();
+        assert_eq!(assembler.add(&[5], 4), Err(AssemblerError));
+        assembler.add(&[1, 2], 0).unwrap();
+        assert_eq!(assembler.assemble(), Some(&[1, 2, 3, 4][..]));
+    }
+
+    #[test]
     fn packet_assembler_set() {
         let key = Key { id: 1 };
 
@@ -465,7 +513,7 @@ mod tests {
         for i in 0..REASSEMBLY_BUFFER_COUNT {
             set.get(&Key { id: i }, Instant::ZERO).unwrap();
         }
-        assert!(set.get(&Key { id: 4 }, Instant::ZERO).is_err());
+        assert!(set.get(&Key { id: REASSEMBLY_BUFFER_COUNT }, Instant::ZERO).is_err());
     }
 
     #[test]

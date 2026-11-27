@@ -58,7 +58,7 @@ use crate::{
     config::{DeviceBinding, InterfaceId, RouteInfo},
     consts::{SOCKET_BUFFER_SIZE, STANDARD_MTU},
     device::{ArpEntry, Device, DeviceRxPacket, DeviceRxPoll, NetDeviceError},
-    ip_tos::apply_egress_ip_tos,
+    ip_tos::EgressIpv4FragmentTos,
     rx_meta::packet_meta_for_rx_packet,
 };
 
@@ -164,9 +164,11 @@ struct OwnedRxPacket {
 }
 
 fn rx_metadata(interface_id: InterfaceId, packet: &[u8]) -> RxMetadata {
+    let mut packet_meta = packet_meta_for_rx_packet(packet);
+    packet_meta.reassembly_id = interface_id.get();
     RxMetadata {
         interface_id,
-        packet_meta: packet_meta_for_rx_packet(packet),
+        packet_meta,
     }
 }
 
@@ -488,6 +490,7 @@ pub(crate) type SharedRouteTable = Arc<RawSpinRwLock<RouteTable>>;
 pub struct Router {
     rx_buffer: RouterPacketBuffer,
     tx_buffer: RingBuffer<'static, TxPacket>,
+    ipv4_fragment_tos: EgressIpv4FragmentTos,
     /// One record per socket membership; duplicates preserve shared joins.
     ipv4_multicast_memberships: Vec<(Ipv4Address, InterfaceId)>,
     /// Device indices still awaiting the head TX packet. Accepted, permanently
@@ -518,6 +521,7 @@ impl Router {
         Self {
             rx_buffer,
             tx_buffer,
+            ipv4_fragment_tos: EgressIpv4FragmentTos::default(),
             ipv4_multicast_memberships: Vec::new(),
             pending_fanout: Vec::new(),
             ready_rx: VecDeque::with_capacity(SOCKET_BUFFER_SIZE),
@@ -1148,6 +1152,7 @@ fn inject_loopback_rx_direct(
 /// smoltcp TX token backed by the router's temporary TX buffer.
 pub struct TxToken<'a> {
     buffer: &'a mut RingBuffer<'static, TxPacket>,
+    ipv4_fragment_tos: &'a mut EgressIpv4FragmentTos,
     meta: PacketMeta,
 }
 
@@ -1156,6 +1161,7 @@ impl smoltcp::phy::TxToken for TxToken<'_> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
+        assert!(len <= STANDARD_MTU, "smoltcp TX must respect the router IP MTU");
         // receive()/transmit() checked for a free MTU-sized slot. This token's
         // exclusive borrow prevents any intervening enqueue before consume().
         let slot = self
@@ -1166,7 +1172,7 @@ impl smoltcp::phy::TxToken for TxToken<'_> {
         slot.meta = self.meta;
         let packet = &mut slot.bytes[..len];
         let result = f(packet);
-        apply_egress_ip_tos(packet);
+        self.ipv4_fragment_tos.apply(packet);
         result
     }
 
@@ -1185,7 +1191,7 @@ fn snoop_tcp_packet(buf: &[u8], sockets: &mut SocketSet<'_>) {
             let Ok(packet) = Ipv4Packet::new_checked(buf) else {
                 return;
             };
-            if packet.next_header() != IpProtocol::Tcp {
+            if packet.next_header() != IpProtocol::Tcp || packet.frag_offset() != 0 {
                 return;
             }
             (
@@ -1261,6 +1267,7 @@ impl smoltcp::phy::Device for Router {
             rx_buffer,
             ready_rx,
             tx_buffer,
+            ipv4_fragment_tos,
             ..
         } = self;
         let rx_token = if !rx_buffer.is_empty() {
@@ -1282,6 +1289,7 @@ impl smoltcp::phy::Device for Router {
             rx_token,
             TxToken {
                 buffer: tx_buffer,
+                ipv4_fragment_tos,
                 meta: PacketMeta::default(),
             },
         ))
@@ -1293,6 +1301,7 @@ impl smoltcp::phy::Device for Router {
         } else {
             Some(TxToken {
                 buffer: &mut self.tx_buffer,
+                ipv4_fragment_tos: &mut self.ipv4_fragment_tos,
                 meta: PacketMeta::default(),
             })
         }
@@ -1301,6 +1310,8 @@ impl smoltcp::phy::Device for Router {
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ip;
+        // This device carries bare IP, so 1500 is the IPv4 packet MTU. Large
+        // datagrams are fragmented by smoltcp before they reach TX slots or L2.
         caps.max_transmission_unit = STANDARD_MTU;
         caps.max_burst_size = Some(SOCKET_BUFFER_SIZE);
         // smoltcp does not distinguish raw transport payloads from stack-
@@ -2739,23 +2750,26 @@ mod tcp_frame_tests {
 }
 
 #[cfg(all(test, feature = "host-test"))]
-mod ipv4_multicast_tests {
+mod ipv4_fragment_tests {
     use ax_sync::RawSpinLock;
     use smoltcp::{
         iface::{Config, Interface, SocketHandle},
         socket::udp,
-        wire::{HardwareAddress, IpEndpoint},
+        wire::{EthernetFrame, EthernetProtocol, HardwareAddress, IpEndpoint},
     };
 
     use super::*;
     use crate::{
         consts::{UDP_RX_BUF_LEN, UDP_TX_BUF_LEN},
         device::{EthernetDevice, EthernetFramePort, NetDeviceResult, ProtocolEthernetFrame},
+        ip_tos::{EgressIpTosKey, clear_egress_ip_tos, set_egress_ip_tos},
+        rx_meta::{ReceivedTrafficClass, received_traffic_class},
     };
 
     #[derive(Default)]
     struct Wire {
         frames: VecDeque<ProtocolEthernetFrame>,
+        emitted: Vec<Vec<u8>>,
         stalls: usize,
     }
 
@@ -2767,7 +2781,7 @@ mod ipv4_multicast_tests {
 
     impl EthernetFramePort for Port {
         fn device_name(&self) -> &str {
-            "multicast-test"
+            "fragment-test"
         }
 
         fn mac_address(&self) -> [u8; 6] {
@@ -2780,7 +2794,9 @@ mod ipv4_multicast_tests {
                 wire.stalls -= 1;
                 return Err(NetDeviceError::Again);
             }
-            wire.frames.push_back(frame.clone());
+            wire.emitted.push(frame.packet().to_vec());
+            // Reverse each emitted burst to exercise out-of-order reassembly.
+            wire.frames.push_front(frame.clone());
             Ok(())
         }
 
@@ -2807,7 +2823,7 @@ mod ipv4_multicast_tests {
             let mut router = Router::new(Arc::new(RawSpinRwLock::new(RouteTable::new())));
             let dev = router.add_device(
                 id,
-                Box::new(EthernetDevice::new(id, "multicast-test".into(), Box::new(port), Some(ip))),
+                Box::new(EthernetDevice::new(id, "fragment-test".into(), Box::new(port), Some(ip))),
             );
             router.set_ipv4_config(dev, id, 0, Some(ip), None);
             let mut iface = Interface::new(
@@ -2843,47 +2859,112 @@ mod ipv4_multicast_tests {
             let socket = self.sockets.get_mut::<udp::Socket>(handle);
             while socket.can_recv() {
                 let (bytes, meta) = socket.recv().unwrap();
+                assert_eq!(received_traffic_class(meta.meta), Some(ReceivedTrafficClass::Ipv4(0x2e)));
                 received.push((meta.endpoint.port, bytes.to_vec()));
             }
         }
     }
 
     #[test]
-    fn multicast_udp_crosses_ethernet_and_echoes_locally_only_when_enabled() {
-        for multicast_loop in [false, true] {
+    fn ordinary_udp_crosses_ethernet_with_fragments_backpressure_and_multicast_echo() {
+        // Cover the unfragmented boundary, one-byte final fragment, multiple
+        // fragments and the largest legal IPv4 UDP payload with real budgets.
+        let lengths = [1472usize, 1473, 2048, 4096, 65507];
+        for (mode, multicast_loop) in [None, Some(false), Some(true)].into_iter().enumerate() {
             let outbound = Arc::new(RawSpinLock::new(Wire { stalls: 2, ..Wire::default() }));
             let inbound = Arc::new(RawSpinLock::new(Wire::default()));
             let mut sender = Endpoint::new(2, Arc::clone(&inbound), Arc::clone(&outbound));
             let mut receiver = Endpoint::new(3, Arc::clone(&outbound), Arc::clone(&inbound));
             let group = Ipv4Address::new(239, 1, 2, 3);
-            sender.join(group);
-            receiver.join(group);
-            let sender_port = 49173;
+            let destination = if multicast_loop.is_some() {
+                sender.join(group);
+                receiver.join(group);
+                group
+            } else {
+                Ipv4Address::new(10, 0, 0, 3)
+            };
             let receiver_port = 49971;
-            let send = sender.socket(sender_port);
             let receive = receiver.socket(receiver_port);
             let local_echo = sender.socket(receiver_port);
-            let payload = b"multicast UDP";
-            let remote = IpEndpoint::new(group.into(), receiver_port);
-            let socket = sender.sockets.get_mut::<udp::Socket>(send);
-            socket.set_multicast_loop(multicast_loop);
-            socket.send_slice(payload, remote).unwrap();
+            let mut expected = Vec::new();
+            let mut keys = Vec::new();
+            let mut pending_max = None;
+            for (index, len) in lengths.into_iter().enumerate() {
+                let port = 49173 + (mode * 10 + index) as u16;
+                let handle = sender.socket(port);
+                let payload: Vec<u8> = (0..len).map(|n| (n.wrapping_mul(37) + index) as u8).collect();
+                let remote = IpEndpoint::new(destination.into(), receiver_port);
+                let key = EgressIpTosKey::exact(
+                    IpProtocol::Udp,
+                    (Ipv4Address::new(10, 0, 0, 2), port).into(),
+                    remote,
+                ).unwrap();
+                set_egress_ip_tos(key, 0x2e);
+                keys.push(key);
+                let meta = udp::UdpMetadata::from(remote);
+                sender.sockets.get_mut::<udp::Socket>(handle)
+                    .set_multicast_loop(multicast_loop.unwrap_or(false));
+                if index + 1 == lengths.len() {
+                    pending_max = Some((handle, meta));
+                } else {
+                    sender.sockets.get_mut::<udp::Socket>(handle).send_slice(&payload, meta).unwrap();
+                }
+                expected.push((port, payload));
+            }
 
             let mut received = Vec::new();
             let mut echoed = Vec::new();
-            for tick in 0..8 {
+            for tick in 0..128 {
+                // A maximum datagram fills the socket's 64 KiB receive ring.
+                // Drain the concurrent smaller datagrams before queuing it.
+                if received.len() == lengths.len() - 1
+                    && let Some((handle, meta)) = pending_max.take()
+                {
+                    sender.sockets.get_mut::<udp::Socket>(handle)
+                        .send_slice(&expected.last().unwrap().1, meta).unwrap();
+                }
                 let timestamp = Instant::from_millis(tick);
                 sender.poll(timestamp);
                 receiver.poll(timestamp);
                 sender.drain(local_echo, &mut echoed);
                 receiver.drain(receive, &mut received);
             }
-            assert_eq!(received, [(sender_port, payload.to_vec())]);
-            if multicast_loop {
-                assert_eq!(echoed, received);
-            } else {
-                assert!(echoed.is_empty());
+            for key in keys {
+                clear_egress_ip_tos(key);
             }
+            received.sort_by_key(|(port, _)| *port);
+            echoed.sort_by_key(|(port, _)| *port);
+            assert_eq!(received, expected, "mode {mode}: reassembly lost or changed a UDP datagram");
+            if multicast_loop == Some(true) {
+                assert_eq!(echoed, expected, "every multicast fragment must preserve local echo intent");
+            } else {
+                assert!(echoed.is_empty(), "multicast loop disabled must suppress local echo");
+            }
+
+            let wire = outbound.lock_irqsave();
+            let mut udp_fragments = 0;
+            for bytes in &wire.emitted {
+                let frame = EthernetFrame::new_checked(&bytes[..]).unwrap();
+                if frame.ethertype() != EthernetProtocol::Ipv4 {
+                    continue;
+                }
+                let packet = Ipv4Packet::new_checked(frame.payload()).unwrap();
+                if packet.next_header() != IpProtocol::Udp {
+                    continue;
+                }
+                udp_fragments += 1;
+                assert!(bytes.len() <= STANDARD_MTU + EthernetFrame::<&[u8]>::header_len());
+                assert!(packet.total_len() as usize <= STANDARD_MTU);
+                assert!(packet.verify_checksum());
+                assert_eq!((packet.dscp() << 2) | packet.ecn(), 0x2e);
+                if packet.more_frags() {
+                    assert!(!packet.dont_frag());
+                    assert_eq!(packet.payload().len() % 8, 0);
+                }
+            }
+            let payload_mtu = (STANDARD_MTU - 20) / 8 * 8;
+            let expected_fragments: usize = lengths.into_iter().map(|len| (len + 8).div_ceil(payload_mtu)).sum();
+            assert_eq!(udp_fragments, expected_fragments, "backpressure duplicated or lost a fragment");
         }
     }
 }
