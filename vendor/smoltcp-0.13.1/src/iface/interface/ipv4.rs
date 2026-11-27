@@ -7,14 +7,14 @@ impl Interface {
     /// processed or emitted, and thus, whether the readiness of any socket might
     /// have changed.
     #[cfg(feature = "proto-ipv4-fragmentation")]
-    pub(super) fn ipv4_egress(&mut self, device: &mut (impl Device + ?Sized)) {
+    pub(super) fn ipv4_egress(&mut self, device: &mut (impl Device + ?Sized)) -> bool {
         // Reset the buffer when we transmitted everything.
         if self.fragmenter.finished() {
             self.fragmenter.reset();
         }
 
         if self.fragmenter.is_empty() {
-            return;
+            return false;
         }
 
         let pkt = &self.fragmenter;
@@ -23,7 +23,9 @@ impl Interface {
         {
             self.inner
                 .dispatch_ipv4_frag(tx_token, &mut self.fragmenter);
+            return true;
         }
+        false
     }
 }
 
@@ -101,6 +103,8 @@ impl InterfaceInner {
         frag: &'a mut FragmentsBuffer,
     ) -> Option<Packet<'a>> {
         let mut ipv4_repr = check!(Ipv4Repr::parse(ipv4_packet, &self.caps.checksum));
+        #[cfg(feature = "proto-ipv4-fragmentation")]
+        let mut meta = meta;
         if !self.is_unicast_v4(ipv4_repr.src_addr) && !ipv4_repr.src_addr.is_unspecified() {
             // Discard packets with non-unicast source addresses but allow unspecified
             net_debug!("non-unicast or unspecified source address");
@@ -110,7 +114,20 @@ impl InterfaceInner {
         #[cfg(feature = "proto-ipv4-fragmentation")]
         let ip_payload = {
             if ipv4_packet.more_frags() || ipv4_packet.frag_offset() != 0 {
-                let key = FragKey::Ipv4(ipv4_packet.get_key());
+                let offset = ipv4_packet.frag_offset() as usize;
+                let payload = ipv4_packet.payload();
+                let Some(end) = offset.checked_add(payload.len()) else {
+                    return None;
+                };
+                if ipv4_packet.dont_frag()
+                    || payload.is_empty()
+                    || (ipv4_packet.more_frags() && !payload.len().is_multiple_of(8))
+                    || end > u16::MAX as usize - ipv4_packet.header_len() as usize
+                {
+                    net_debug!("Invalid IPv4 fragment bounds or flags");
+                    return None;
+                }
+                let key = FragKey::Ipv4(ipv4_packet.get_key(), meta.reassembly_id);
 
                 let f = match frag.assembler.get(&key, self.now + frag.reassembly_timeout) {
                     Ok(f) => f,
@@ -120,20 +137,24 @@ impl InterfaceInner {
                     }
                 };
 
-                if !ipv4_packet.more_frags() {
-                    // This is the last fragment, so we know the total size
-                    check!(f.set_total_size(
-                        ipv4_packet.total_len() as usize - ipv4_packet.header_len() as usize
-                            + ipv4_packet.frag_offset() as usize,
-                    ));
+                if !ipv4_packet.more_frags() && f.set_total_size(end).is_err() {
+                    f.reset();
+                    return None;
+                }
+                if offset == 0 {
+                    f.ipv4_header = Some((ipv4_repr, meta));
                 }
 
-                if let Err(e) = f.add(ipv4_packet.payload(), ipv4_packet.frag_offset() as usize) {
+                if let Err(e) = f.add(payload, offset) {
                     net_debug!("fragmentation error: {:?}", e);
+                    f.reset();
                     return None;
                 }
 
+                let (first_repr, first_meta) = f.ipv4_header?;
                 let payload = f.assemble()?;
+                ipv4_repr = first_repr;
+                meta = first_meta;
                 // Update the payload length, so that the raw sockets get the correct value.
                 ipv4_repr.payload_len = payload.len();
                 payload
@@ -418,7 +439,7 @@ impl InterfaceInner {
     }
 
     #[cfg(feature = "proto-ipv4-fragmentation")]
-    pub(super) fn dispatch_ipv4_frag<Tx: TxToken>(&mut self, tx_token: Tx, frag: &mut Fragmenter) {
+    pub(super) fn dispatch_ipv4_frag<Tx: TxToken>(&mut self, mut tx_token: Tx, frag: &mut Fragmenter) {
         let caps = self.caps.clone();
 
         let max_fragment_size = caps.max_ipv4_fragment_size(frag.ipv4.repr.buffer_len());
@@ -452,6 +473,7 @@ impl InterfaceInner {
             }
         };
 
+        tx_token.set_meta(frag.ipv4.meta);
         tx_token.consume(tx_len, |mut tx_buffer| {
             #[cfg(feature = "medium-ethernet")]
             if matches!(self.caps.medium, Medium::Ethernet) {

@@ -520,7 +520,9 @@ impl Interface {
             #[cfg(any(feature = "medium-ethernet", feature = "medium-ip"))]
             _ => {
                 #[cfg(feature = "proto-ipv4-fragmentation")]
-                self.ipv4_egress(device);
+                if self.ipv4_egress(device) {
+                    return PollResult::SocketStateChanged;
+                }
             }
         }
 
@@ -733,7 +735,11 @@ impl Interface {
 
                 inner
                     .dispatch_ip(t, meta, response, &mut self.fragmenter)
-                    .map_err(|_| EgressError::Dispatch)?;
+                    .map_err(|error| match error {
+                        #[cfg(feature = "proto-ipv4-fragmentation")]
+                        DispatchError::FragmentationBusy => EgressError::Exhausted,
+                        _ => EgressError::Dispatch,
+                    })?;
 
                 result = PollResult::SocketStateChanged;
 
@@ -1277,10 +1283,19 @@ impl InterfaceInner {
         match &mut ip_repr {
             #[cfg(feature = "proto-ipv4")]
             IpRepr::Ipv4(repr) => {
+                if total_ip_len > u16::MAX as usize {
+                    net_debug!("IPv4 packet exceeds the maximum total length. Dropping.");
+                    return Ok(());
+                }
                 // If we have an IPv4 packet, then we need to check if we need to fragment it.
                 if total_ip_len > self.caps.ip_mtu() {
                     #[cfg(feature = "proto-ipv4-fragmentation")]
                     {
+                        // One buffer is shared by all sockets and ingress replies.
+                        // Keep the next datagram queued until its predecessor is sent.
+                        if !frag.is_empty() && !frag.finished() {
+                            return Err(DispatchError::FragmentationBusy);
+                        }
                         net_debug!("start fragmentation");
 
                         // Calculate how much we will send now (including the Ethernet header).
@@ -1295,7 +1310,7 @@ impl InterfaceInner {
                             tx_len += EthernetFrame::<&[u8]>::header_len();
                         }
 
-                        if frag.buffer.len() < total_ip_len {
+                        if first_frag_data_len == 0 || frag.buffer.len() < total_ip_len {
                             net_debug!(
                                 "Fragmentation buffer is too small, at least {} needed. Dropping",
                                 total_ip_len
@@ -1314,17 +1329,16 @@ impl InterfaceInner {
 
                         // Save the IP header for other fragments.
                         frag.ipv4.repr = *repr;
-
-                        // Modify the IP header
-                        repr.payload_len = first_frag_data_len;
+                        frag.ipv4.meta = meta;
 
                         // Save the number of bytes we will send now.
                         frag.sent_bytes = first_frag_ip_len;
 
                         // Emit the IP header to the buffer.
-                        emit_ip(&ip_repr, &mut frag.buffer);
+                        emit_ip(&ip_repr, &mut frag.buffer[..total_ip_len]);
 
                         let mut ipv4_packet = Ipv4Packet::new_unchecked(&mut frag.buffer[..]);
+                        ipv4_packet.set_total_len(first_frag_ip_len as u16);
                         frag.ipv4.ident = ipv4_id;
                         ipv4_packet.set_ident(ipv4_id);
                         ipv4_packet.set_more_frags(true);
@@ -1336,6 +1350,7 @@ impl InterfaceInner {
                         }
 
                         // Transmit the first packet.
+                        tx_token.set_meta(meta);
                         tx_token.consume(tx_len, |mut tx_buffer| {
                             #[cfg(feature = "medium-ethernet")]
                             if matches!(self.caps.medium, Medium::Ethernet) {
@@ -1412,4 +1427,7 @@ enum DispatchError {
     /// the neighbor for it yet. Discovery has been initiated, dispatch
     /// should be retried later.
     NeighborPending,
+    /// The shared fragmentation buffer still owns another datagram.
+    #[cfg(feature = "proto-ipv4-fragmentation")]
+    FragmentationBusy,
 }

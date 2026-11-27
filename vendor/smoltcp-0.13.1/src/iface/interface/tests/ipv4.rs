@@ -837,11 +837,13 @@ fn test_packet_len(#[case] medium: Medium) {
         Instant::ZERO,
     );
 
+    let max_transmission_unit = iface.inner.caps.max_transmission_unit;
+
     for ip_packet_len in [
         100,
         iface.inner.ip_mtu(),
         iface.inner.ip_mtu() + 1,
-        FRAGMENTATION_BUFFER_SIZE,
+        FRAGMENTATION_BUFFER_SIZE.min(u16::MAX as usize),
     ] {
         net_debug!("ip_packet_len: {}", ip_packet_len);
 
@@ -862,20 +864,27 @@ fn test_packet_len(#[case] medium: Medium) {
         ip_repr.payload_len = ip_packet_payload_len;
 
         let udp_packet_payload = vec![1; udp_packet_payload_len];
-        let ip_payload = IpPayload::Udp(udp_repr, &udp_packet_payload);
-        let ip_packet = Packet::new_ipv4(ip_repr, ip_payload);
-
-        assert_eq!(
+        let tx_token = || TestTxToken {
+            max_transmission_unit,
+        };
+        let dispatch = |iface: &mut Interface| {
             iface.inner.dispatch_ip(
-                TestTxToken {
-                    max_transmission_unit: iface.inner.caps.max_transmission_unit
-                },
+                tx_token(),
                 PacketMeta::default(),
-                ip_packet,
+                Packet::new_ipv4(ip_repr, IpPayload::Udp(udp_repr, &udp_packet_payload)),
                 &mut iface.fragmenter,
-            ),
-            Ok(())
-        );
+            )
+        };
+
+        assert_eq!(dispatch(&mut iface), Ok(()));
+        if !iface.fragmenter.finished() {
+            assert_eq!(dispatch(&mut iface), Err(DispatchError::FragmentationBusy));
+            while !iface.fragmenter.finished() {
+                iface
+                    .inner
+                    .dispatch_ipv4_frag(tx_token(), &mut iface.fragmenter);
+            }
+        }
     }
 }
 
@@ -1351,6 +1360,40 @@ fn test_raw_socket_rx_fragmentation(#[case] medium: Medium) {
         let socket = sockets.get_mut::<raw::Socket>(handle);
         assert!(!socket.can_recv());
     }
+
+    // Malformed fragments must not poison the in-progress valid datagram.
+    for bytes in [
+        build_fragment(7, true, 0, 0xEE),
+        build_fragment(8, false, 65528, 0xEE),
+    ] {
+        let packet = Ipv4Packet::new_unchecked(&bytes[..]);
+        assert_eq!(
+            iface.inner.process_ipv4(
+                &mut sockets,
+                PacketMeta::default(),
+                HardwareAddress::default(),
+                &packet,
+                &mut iface.fragments,
+            ),
+            None
+        );
+        assert!(!sockets.get::<raw::Socket>(handle).can_recv());
+    }
+
+    // The same IPv4 tuple on another ingress link is a distinct datagram.
+    let mut other_link = PacketMeta::default();
+    other_link.reassembly_id = 1;
+    assert_eq!(
+        iface.inner.process_ipv4(
+            &mut sockets,
+            other_link,
+            HardwareAddress::default(),
+            &frag2,
+            &mut iface.fragments,
+        ),
+        None
+    );
+    assert!(!sockets.get::<raw::Socket>(handle).can_recv());
 
     // After the last fragment, the reassembled packet should be delivered.
     assert_eq!(

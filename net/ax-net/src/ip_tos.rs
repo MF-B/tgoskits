@@ -12,8 +12,8 @@ use ax_lazyinit::LazyLock;
 use ax_sync::RawSpinLock;
 use hashbrown::HashMap;
 use smoltcp::wire::{
-    IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpVersion, Ipv4Packet, Ipv6Packet,
-    TcpPacket, UdpPacket,
+    IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpVersion, Ipv4FragKey, Ipv4Packet,
+    Ipv6Packet, TcpPacket, UdpPacket,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -101,6 +101,46 @@ pub(crate) fn clear_egress_ip_tos(key: EgressIpTosKey) {
     EGRESS_IP_TOS.clear(key);
 }
 
+/// The protocol executor emits one fragmented datagram at a time. Retain its
+/// TOS because subsequent fragments do not contain a transport header.
+#[derive(Default)]
+pub(crate) struct EgressIpv4FragmentTos {
+    current: Option<(Ipv4FragKey, u8)>,
+}
+
+impl EgressIpv4FragmentTos {
+    pub(crate) fn apply(&mut self, packet: &mut [u8]) {
+        if !EGRESS_IP_TOS.is_active() && self.current.is_none() {
+            return;
+        }
+        let fragment = match IpVersion::of_packet(packet) {
+            Ok(IpVersion::Ipv4) => Ipv4Packet::new_checked(&*packet).ok().and_then(|ip| {
+                (ip.more_frags() || ip.frag_offset() != 0)
+                    .then_some((ip.get_key(), ip.frag_offset(), ip.more_frags()))
+            }),
+            _ => None,
+        };
+        if let Some((key, offset, more)) = fragment
+            && offset != 0
+        {
+            if let Some((current, tos)) = self.current
+                && current == key
+            {
+                apply_ip_tos(packet, tos);
+                if !more {
+                    self.current = None;
+                }
+            }
+            return;
+        }
+
+        apply_egress_ip_tos(packet);
+        if let Some((key, _, _)) = fragment {
+            self.current = Some((key, packet[1]));
+        }
+    }
+}
+
 pub(crate) fn apply_egress_ip_tos(packet: &mut [u8]) {
     if !EGRESS_IP_TOS.is_active() {
         return;
@@ -132,16 +172,20 @@ pub(crate) fn apply_ip_tos(packet: &mut [u8], tos: u8) {
 }
 
 fn packet_egress_ip_tos(packet: &[u8]) -> u8 {
-    let (protocol, local_addr, remote_addr, payload) = match IpVersion::of_packet(packet) {
+    let (protocol, local_addr, remote_addr, payload, first_fragment) = match IpVersion::of_packet(packet) {
         Ok(IpVersion::Ipv4) => {
             let Ok(packet) = Ipv4Packet::new_checked(packet) else {
                 return 0;
             };
+            if packet.frag_offset() != 0 {
+                return 0;
+            }
             (
                 packet.next_header(),
                 IpAddress::Ipv4(packet.src_addr()),
                 IpAddress::Ipv4(packet.dst_addr()),
                 packet.payload(),
+                packet.more_frags(),
             )
         }
         Ok(IpVersion::Ipv6) => {
@@ -153,6 +197,7 @@ fn packet_egress_ip_tos(packet: &[u8]) -> u8 {
                 IpAddress::Ipv6(packet.src_addr()),
                 IpAddress::Ipv6(packet.dst_addr()),
                 packet.payload(),
+                false,
             )
         }
         Err(_) => return 0,
@@ -166,8 +211,10 @@ fn packet_egress_ip_tos(packet: &[u8]) -> u8 {
             (packet.src_port(), packet.dst_port())
         }
         IpProtocol::Udp => {
-            let Ok(packet) = UdpPacket::new_checked(payload) else {
-                return 0;
+            let packet = match UdpPacket::new_checked(payload) {
+                Ok(packet) => packet,
+                Err(_) if first_fragment && payload.len() >= 8 => UdpPacket::new_unchecked(payload),
+                Err(_) => return 0,
             };
             (packet.src_port(), packet.dst_port())
         }
