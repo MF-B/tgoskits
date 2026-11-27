@@ -27,6 +27,7 @@
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use core::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::atomic::{AtomicU8, Ordering},
     task::Waker,
 };
 
@@ -60,6 +61,10 @@ use crate::{
     rx_meta::{ReceivedTrafficClass, received_traffic_class},
 };
 
+const RCV_SHUTDOWN: u8 = 1;
+const SEND_SHUTDOWN: u8 = 2;
+const SHUTDOWN_MASK: u8 = RCV_SHUTDOWN | SEND_SHUTDOWN;
+
 /// Buffered state for MSG_MORE corking: captures the target endpoint
 /// and source address at the first MSG_MORE call so the merged datagram
 /// is always delivered to the correct peer regardless of subsequent
@@ -86,6 +91,8 @@ pub struct UdpSocket {
     local_addr: Mutex<Option<IpEndpoint>>,
     /// Connected remote endpoint plus selected source address.
     peer_addr: Mutex<Option<(IpEndpoint, IpAddress)>>,
+    /// Permanent shutdown bits, published before waking local waiters.
+    shutdown_state: AtomicU8,
 
     /// Shared socket options and blocking helpers.
     general: GeneralOptions,
@@ -100,6 +107,8 @@ pub struct UdpSocket {
     // Linux serializes UDP corking with the process-context socket lock. This
     // state may remain held while the global protocol socket is contended, so
     // it must be sleepable rather than an IRQ-disabling raw spin lock.
+    // It also serializes sends with write shutdown. When both are needed,
+    // peer_addr precedes cork; neither lock may be held across poll wakeups.
     cork: Mutex<Option<CorkState>>,
     /// Membership changes precede service/socket-set locks; the poller never
     /// takes this lock. Each entry owns one shared interface membership.
@@ -117,6 +126,7 @@ impl UdpSocket {
             bind_lock: Mutex::new(()),
             local_addr: Mutex::new(None),
             peer_addr: Mutex::new(None),
+            shutdown_state: AtomicU8::new(0),
 
             general: GeneralOptions::new(2, 2, 17), // SOCK_DGRAM
             poll_state: Arc::new(PollSet::new()),
@@ -488,10 +498,8 @@ impl SocketOps for UdpSocket {
                 0,
             )))?;
         }
-        // MSG_MORE corking: buffer data instead of sending immediately.
-        // Cap corked data to the UDP TX buffer size to prevent
-        // unbounded kernel memory allocation from user input.
-        const CORK_MAX: usize = UDP_TX_BUF_LEN;
+        // MSG_MORE buffers one datagram, bounded by its IP/UDP length fields
+        // as well as the socket's TX capacity.
         let more = options.flags.contains(SendFlags::MORE);
 
         if more {
@@ -509,13 +517,19 @@ impl SocketOps for UdpSocket {
             if remote_addr.port == 0 || remote_addr.addr.is_unspecified() {
                 return Err(NetError::InvalidInput);
             }
+            let mut cork = self.cork.lock();
+            let remote = cork.as_ref().map_or(remote_addr, |pending| pending.remote);
+            let previous = cork.as_ref().map_or(0, |pending| pending.buf.len());
             let len = src.remaining();
-            if len > CORK_MAX {
+            let total = previous.checked_add(len).ok_or(NetError::MessageTooLong)?;
+            if total > max_payload_len(remote.addr) {
                 return Err(NetError::MessageTooLong);
+            }
+            if self.shutdown_state.load(Ordering::Acquire) & SEND_SHUTDOWN != 0 {
+                return Err(NetError::BrokenPipe);
             }
             let mut tmp = alloc::vec![0u8; len];
             let read = src.read(&mut tmp)?;
-            let mut cork = self.cork.lock();
             if cork.is_none() {
                 *cork = Some(CorkState {
                     buf: tmp[..read].to_vec(),
@@ -523,11 +537,6 @@ impl SocketOps for UdpSocket {
                     source: source_addr,
                 });
             } else {
-                let prev = cork.as_ref().unwrap().buf.len();
-                let new_len = prev.checked_add(read).ok_or(NetError::MessageTooLong)?;
-                if new_len > CORK_MAX {
-                    return Err(NetError::MessageTooLong);
-                }
                 cork.as_mut().unwrap().buf.extend_from_slice(&tmp[..read]);
             }
             return Ok(read);
@@ -555,7 +564,7 @@ impl SocketOps for UdpSocket {
                 .len()
                 .checked_add(src.remaining())
                 .ok_or(NetError::MessageTooLong)?;
-            if total > CORK_MAX {
+            if total > max_payload_len(c.remote.addr) {
                 return Err(NetError::MessageTooLong);
             }
             (c.remote, Some(c.source), total)
@@ -565,11 +574,17 @@ impl SocketOps for UdpSocket {
                     if remote.port == 0 || remote.addr.is_unspecified() {
                         return Err(NetError::InvalidInput);
                     }
+                    if src.remaining() > max_payload_len(remote.addr) {
+                        return Err(NetError::MessageTooLong);
+                    }
                     (remote, Some(source), src.remaining())
                 }
                 None => return Err(NetError::DestAddrRequired),
             }
         };
+        if self.shutdown_state.load(Ordering::Acquire) & SEND_SHUTDOWN != 0 {
+            return Err(NetError::BrokenPipe);
+        }
         let result = self.with_smol_socket(|socket| {
             if !socket.is_open() {
                 // not connected
@@ -649,7 +664,20 @@ impl SocketOps for UdpSocket {
         request_poll();
         self.with_smol_socket(|socket| {
             if !socket.can_recv() {
-                Err(NetError::WouldBlock)
+                // Linux dequeues datagrams before considering SHUT_RD. Its
+                // empty-queue EOF path is reached only by blocking receives;
+                // MSG_DONTWAIT and O_NONBLOCK still report EAGAIN.
+                if self.shutdown_state.load(Ordering::Acquire) & RCV_SHUTDOWN != 0
+                    && !self.general.nonblocking()
+                    && !options.flags.contains(RecvFlags::DONTWAIT)
+                {
+                    if let Some(no_source) = options.no_source.as_deref_mut() {
+                        *no_source = true;
+                    }
+                    Ok(0)
+                } else {
+                    Err(NetError::WouldBlock)
+                }
             } else {
                 let result = if options.flags.contains(RecvFlags::PEEK) {
                     socket.peek().map(|(data, meta)| (data, *meta))
@@ -673,6 +701,9 @@ impl SocketOps for UdpSocket {
                                     return Err(NetError::WouldBlock);
                                 }
                             }
+                        }
+                        if let Some(no_source) = options.no_source.as_deref_mut() {
+                            *no_source = false;
                         }
 
                         let read = dst.write(src)?;
@@ -735,34 +766,57 @@ impl SocketOps for UdpSocket {
             .map(SocketAddrEx::Ip)
     }
 
-    fn shutdown(&self, _how: Shutdown) -> NetResult {
-        // TODO(mivik): shutdown
-        request_poll();
+    fn shutdown(&self, how: Shutdown) -> NetResult {
+        let mut shutdown = 0;
+        if how.has_read() {
+            shutdown |= RCV_SHUTDOWN;
+        }
+        if how.has_write() {
+            shutdown |= SEND_SHUTDOWN;
+        }
+        let connected = {
+            let peer = self.peer_addr.lock();
+            let mut cork = self.cork.lock();
+            if how.has_write() {
+                *cork = None;
+            }
+            self.shutdown_state.fetch_or(shutdown, Ordering::Release);
+            peer.is_some()
+        };
 
-        self.with_smol_socket(|socket| {
-            debug!("UDP socket {}: shutting down", self.handle);
-            socket.close();
-        });
-        Ok(())
+        let mut events = IoEvents::empty();
+        events.set(IoEvents::IN | IoEvents::RDHUP, how.has_read());
+        events.set(IoEvents::OUT, how.has_write());
+        events.set(
+            IoEvents::HUP,
+            self.shutdown_state.load(Ordering::Acquire) == SHUTDOWN_MASK,
+        );
+        self.readiness_version.publish();
+        // SAFETY: permanent state is published and no socket lock is held.
+        // Every blocked receiver must observe EOF, including exclusive ones.
+        unsafe { self.poll_state.wake_all(events) };
+
+        // Linux inet_shutdown applies the flags and wakes waiters even when
+        // an unconnected UDP socket reports ENOTCONN to the shutdown caller.
+        if connected {
+            Ok(())
+        } else {
+            Err(NetError::NotConnected)
+        }
     }
 }
 
 impl Pollable for UdpSocket {
     fn poll(&self) -> IoEvents {
         request_poll();
-        let Some(local_addr) = self.local_addr.try_lock() else {
-            return IoEvents::empty();
-        };
-        if local_addr.is_none() {
-            return IoEvents::empty();
-        }
-        drop(local_addr);
-
+        let shutdown = self.shutdown_state.load(Ordering::Acquire);
         let mut events = IoEvents::empty();
         self.with_smol_socket(|socket| {
-            events.set(IoEvents::IN, socket.can_recv());
-            events.set(IoEvents::OUT, socket.can_send());
+            events.set(IoEvents::IN, socket.can_recv() || shutdown & RCV_SHUTDOWN != 0);
+            events.set(IoEvents::OUT, socket.can_send() || shutdown & SEND_SHUTDOWN != 0);
         });
+        events.set(IoEvents::RDHUP, shutdown & RCV_SHUTDOWN != 0);
+        events.set(IoEvents::HUP, shutdown == SHUTDOWN_MASK);
         events
     }
 
@@ -823,7 +877,7 @@ impl Drop for UdpSocket {
         // is not lost (Linux keeps the datagram in the peer's receive buffer).
         // smoltcp's `close()` drops the send buffer, so this must run before it.
         flush_egress();
-        self.shutdown(Shutdown::Both).ok();
+        self.with_smol_socket(|socket| socket.close());
         self.leave_ipv4_memberships();
         self.clear_tracked_egress_ip_tos();
         SOCKET_SET.remove(self.handle);
@@ -834,4 +888,14 @@ fn get_ephemeral_port() -> NetResult<u16> {
     allocate_ephemeral_port(|port| {
         SOCKET_SET.udp_port_available(IpAddress::Ipv4(Ipv4Addr::UNSPECIFIED), port)
     })
+}
+
+fn max_payload_len(remote: IpAddress) -> usize {
+    // IPv4's total length includes the minimum 20-byte IP header, whereas
+    // IPv6's payload length starts after its fixed header. UDP uses 8 bytes.
+    let protocol_limit = match remote {
+        IpAddress::Ipv4(_) => u16::MAX as usize - 20 - 8,
+        IpAddress::Ipv6(_) => u16::MAX as usize - 8,
+    };
+    protocol_limit.min(UDP_TX_BUF_LEN)
 }

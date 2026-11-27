@@ -209,6 +209,9 @@ pub struct SendOptions {
 pub struct RecvOptions<'a> {
     /// If set, the sender's address is written here.
     pub from: Option<&'a mut SocketAddrEx>,
+    /// If set, a receive with no source address (such as UDP shutdown EOF)
+    /// sets this to `true`. Initialize it to `false` before receiving.
+    pub no_source: Option<&'a mut bool>,
     /// Receive flags.
     pub flags: RecvFlags,
     /// If set, ancillary control messages are appended here.
