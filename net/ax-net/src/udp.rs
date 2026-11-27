@@ -52,7 +52,10 @@ use crate::{
     general::GeneralOptions,
     get_control, interface_by_id,
     ip_tos::{EgressIpTosKey, clear_egress_ip_tos, set_egress_ip_tos},
-    options::{Configurable, GetSocketOption, SetSocketOption},
+    options::{
+        Configurable, GetSocketOption, Ipv4MulticastInterface, Ipv4MulticastMembership,
+        SetSocketOption,
+    },
     request_poll,
     rx_meta::{ReceivedTrafficClass, received_traffic_class},
 };
@@ -65,6 +68,12 @@ struct CorkState {
     buf: Vec<u8>,
     remote: IpEndpoint,
     source: IpAddress,
+}
+
+#[derive(Default)]
+struct Ipv4MulticastState {
+    output: Ipv4MulticastInterface,
+    memberships: Vec<(Ipv4Addr, InterfaceId)>,
 }
 
 /// A UDP socket that provides POSIX-like APIs.
@@ -92,6 +101,9 @@ pub struct UdpSocket {
     // state may remain held while the global protocol socket is contended, so
     // it must be sleepable rather than an IRQ-disabling raw spin lock.
     cork: Mutex<Option<CorkState>>,
+    /// Membership changes precede service/socket-set locks; the poller never
+    /// takes this lock. Each entry owns one shared interface membership.
+    multicast: Mutex<Ipv4MulticastState>,
 }
 
 impl UdpSocket {
@@ -111,6 +123,7 @@ impl UdpSocket {
             readiness_version: ReadinessVersion::new(),
             tos_keys: RawSpinLock::new(Vec::new()),
             cork: Mutex::new(None),
+            multicast: Mutex::new(Ipv4MulticastState::default()),
         }
     }
 
@@ -137,9 +150,14 @@ impl UdpSocket {
 
     /// Returns the connected peer and cached source address.
     fn remote_endpoint(&self) -> NetResult<(IpEndpoint, IpAddress)> {
-        match self.peer_addr.try_lock() {
-            Some(addr) => addr.ok_or(NetError::NotConnected),
-            None => Err(NetError::NotConnected),
+        let (endpoint, source) = match self.peer_addr.try_lock() {
+            Some(addr) => addr.ok_or(NetError::NotConnected)?,
+            None => return Err(NetError::NotConnected),
+        };
+        if endpoint.addr.is_multicast() {
+            Ok((endpoint, self.send_source_for_remote(&endpoint.addr)?))
+        } else {
+            Ok((endpoint, source))
         }
     }
 
@@ -151,7 +169,16 @@ impl UdpSocket {
     }
 
     fn send_source_for_remote(&self, remote: &IpAddress) -> NetResult<IpAddress> {
+        if let IpAddress::Ipv4(group) = remote
+            && group.is_multicast()
+        {
+            let output = self.multicast.lock().output;
+            return self
+                .resolve_multicast_interface(*group, output)
+                .map(|(_, source)| source);
+        }
         if let Some(local_ep) = *self.local_addr.lock()
+            && !local_ep.addr.is_multicast()
             && !local_ep.addr.is_unspecified()
         {
             Ok(local_ep.addr)
@@ -164,7 +191,11 @@ impl UdpSocket {
         &self,
         remote: &IpAddress,
     ) -> NetResult<(IpAddress, bool)> {
+        if remote.is_multicast() {
+            return Ok((self.send_source_for_remote(remote)?, false));
+        }
         if let Some(local_ep) = *self.local_addr.lock()
+            && !local_ep.addr.is_multicast()
             && !local_ep.addr.is_unspecified()
         {
             Ok((local_ep.addr, false))
@@ -210,6 +241,88 @@ impl UdpSocket {
             clear_egress_ip_tos(key);
         }
     }
+
+    fn resolve_multicast_interface(
+        &self,
+        group: Ipv4Addr,
+        selection: Ipv4MulticastInterface,
+    ) -> NetResult<(InterfaceId, IpAddress)> {
+        let binding = self.general.device_binding();
+        let selected = if let Some(interface_id) = selection.interface {
+            Some(interface_id)
+        } else if !selection.address.is_unspecified() {
+            get_control()
+                .local_binding_for(&IpListenEndpoint {
+                    addr: Some(IpAddress::Ipv4(selection.address)),
+                    port: 0,
+                })?
+                .bound_if
+        } else {
+            binding.bound_if
+        };
+        let interface_id = match selected {
+            Some(interface_id) => interface_id,
+            None => get_control().select_route(&IpAddress::Ipv4(group))?.interface_id,
+        };
+        if binding.bound_if.is_some_and(|bound| bound != interface_id) {
+            return Err(NetError::InvalidInput);
+        }
+        let interface = interface_by_id(interface_id).ok_or(NetError::NoSuchDevice)?;
+        let source = interface.ipv4.ok_or(NetError::NoSuchDeviceOrAddress)?.address.address();
+        Ok((interface_id, IpAddress::Ipv4(source)))
+    }
+
+    fn add_ipv4_membership(&self, request: Ipv4MulticastMembership) -> NetResult {
+        if !request.group.is_multicast() {
+            return Err(NetError::InvalidInput);
+        }
+        let (interface_id, _) =
+            self.resolve_multicast_interface(request.group, request.interface)?;
+        let mut multicast = self.multicast.lock();
+        let membership = (request.group, interface_id);
+        if multicast.memberships.contains(&membership) {
+            return Err(NetError::AddrInUse);
+        }
+        crate::get_service().join_ipv4_multicast(request.group, interface_id)?;
+        multicast.memberships.push(membership);
+        drop(multicast);
+        request_poll();
+        Ok(())
+    }
+
+    fn drop_ipv4_membership(&self, request: Ipv4MulticastMembership) -> NetResult {
+        if !request.group.is_multicast() {
+            return Err(NetError::InvalidInput);
+        }
+        let interface_id = if request.interface == Ipv4MulticastInterface::default() {
+            None
+        } else {
+            Some(self.resolve_multicast_interface(request.group, request.interface)?.0)
+        };
+        let mut multicast = self.multicast.lock();
+        let index = multicast.memberships.iter().position(|(group, id)| {
+            *group == request.group && interface_id.is_none_or(|selected| selected == *id)
+        }).ok_or(NetError::NoSuchDeviceOrAddress)?;
+        let (group, interface_id) = multicast.memberships.swap_remove(index);
+        crate::get_service().leave_ipv4_multicast(group, interface_id);
+        drop(multicast);
+        request_poll();
+        Ok(())
+    }
+
+    fn leave_ipv4_memberships(&self) {
+        let memberships = core::mem::take(&mut self.multicast.lock().memberships);
+        if memberships.is_empty() {
+            return;
+        }
+        {
+            let mut service = crate::get_service();
+            for (group, interface_id) in memberships {
+                service.leave_ipv4_multicast(group, interface_id);
+            }
+        }
+        request_poll();
+    }
 }
 
 impl Configurable for UdpSocket {
@@ -230,6 +343,15 @@ impl Configurable for UdpSocket {
             }
             O::ReceiveBuffer(size) => {
                 **size = UDP_RX_BUF_LEN;
+            }
+            O::Ipv4MulticastInterface(interface) => {
+                **interface = self.multicast.lock().output;
+            }
+            O::Ipv4MulticastTtl(ttl) => {
+                **ttl = self.with_smol_socket(|socket| socket.multicast_hop_limit());
+            }
+            O::Ipv4MulticastLoop(enabled) => {
+                **enabled = self.with_smol_socket(|socket| socket.multicast_loop());
             }
             _ => return Ok(false),
         }
@@ -254,6 +376,20 @@ impl Configurable for UdpSocket {
                     socket.set_hop_limit(Some(*ttl));
                 });
             }
+            O::Ipv4MulticastInterface(interface) => {
+                if *interface != Ipv4MulticastInterface::default() {
+                    self.resolve_multicast_interface(Ipv4Addr::new(224, 0, 0, 1), *interface)?;
+                }
+                self.multicast.lock().output = *interface;
+            }
+            O::Ipv4MulticastTtl(ttl) => {
+                self.with_smol_socket(|socket| socket.set_multicast_hop_limit(*ttl));
+            }
+            O::Ipv4MulticastLoop(enabled) => {
+                self.with_smol_socket(|socket| socket.set_multicast_loop(*enabled));
+            }
+            O::AddIpv4Membership(request) => self.add_ipv4_membership(*request)?,
+            O::DropIpv4Membership(request) => self.drop_ipv4_membership(*request)?,
             _ => return Ok(false),
         }
         Ok(true)
@@ -277,7 +413,11 @@ impl SocketOps for UdpSocket {
             addr: (!local_endpoint.addr.is_unspecified()).then_some(local_endpoint.addr),
             port: local_endpoint.port,
         };
-        let binding = get_control().local_binding_for(&endpoint)?;
+        let binding = if endpoint.addr.is_some_and(|address| address.is_multicast()) {
+            DeviceBinding::default()
+        } else {
+            get_control().local_binding_for(&endpoint)?
+        };
 
         self.with_smol_socket(|socket| {
             socket.bind(endpoint).map_err(|e| match e {
@@ -290,6 +430,7 @@ impl SocketOps for UdpSocket {
             local_endpoint.addr,
             local_endpoint.port,
             self.general.reuse_port(),
+            self.general.reuse_address(),
         ) {
             self.with_smol_socket(|socket| socket.close());
             return Err(err);
@@ -683,6 +824,7 @@ impl Drop for UdpSocket {
         // smoltcp's `close()` drops the send buffer, so this must run before it.
         flush_egress();
         self.shutdown(Shutdown::Both).ok();
+        self.leave_ipv4_memberships();
         self.clear_tracked_egress_ip_tos();
         SOCKET_SET.remove(self.handle);
     }

@@ -35,14 +35,14 @@ use smoltcp::{
 
 use crate::{NetError, NetResult, addr::listen_addrs_conflict};
 
-/// One UDP bind ownership record. Several records share a port only when every
-/// binder requested SO_REUSEPORT on the identical local address, mirroring
-/// Linux's reuseport group semantics.
+/// One UDP bind ownership record. Overlapping UDP binds may share a port when
+/// both owners request SO_REUSEADDR, or join an exact SO_REUSEPORT group.
 #[derive(Clone, Debug)]
 struct UdpBoundEntry {
     /// `None` represents a wildcard bind.
     addr: Option<IpAddress>,
     reuse_port: bool,
+    reuse_address: bool,
     handle: SocketHandle,
 }
 
@@ -80,17 +80,14 @@ impl<'a> SocketSetWrapper<'a> {
         f(socket)
     }
 
-    /// Records a public UDP bind after checking address/reuseport conflicts.
-    ///
-    /// A binder joins an existing group on the same port only when it and every
-    /// colliding owner requested SO_REUSEPORT on the exact same local address;
-    /// any other overlap is rejected with `EADDRINUSE`.
+    /// Records a public UDP bind with Linux address and reuse conflict checks.
     pub fn udp_bind(
         &self,
         handle: SocketHandle,
         addr: IpAddress,
         port: u16,
         reuse_port: bool,
+        reuse_address: bool,
     ) -> NetResult {
         if port == 0 {
             return Ok(());
@@ -98,15 +95,16 @@ impl<'a> SocketSetWrapper<'a> {
         let addr = (!addr.is_unspecified()).then_some(addr);
         let mut binds = self.udp_binds.lock();
         let entries = binds.entry(port).or_default();
-        if entries
-            .iter()
-            .any(|entry| udp_binds_conflict(entry, addr, reuse_port))
-        {
+        if entries.iter().any(|entry| {
+            !(reuse_address && entry.reuse_address)
+                && udp_binds_conflict(entry, addr, reuse_port)
+        }) {
             return Err(NetError::AddrInUse);
         }
         entries.push(UdpBoundEntry {
             addr,
             reuse_port,
+            reuse_address,
             handle,
         });
         Ok(())
@@ -176,6 +174,7 @@ mod tests {
             handle,
             addr,
             reuse_port,
+            reuse_address: false,
         }
     }
 

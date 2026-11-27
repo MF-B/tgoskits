@@ -609,6 +609,11 @@ impl Interface {
             res = res.min(self.inner.slaac.poll_at(timestamp));
         }
 
+        #[cfg(all(feature = "multicast", feature = "proto-ipv4"))]
+        {
+            res = res.into_iter().chain(self.inner.multicast.poll_at()).min();
+        }
+
         res
     }
 

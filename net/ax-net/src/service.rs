@@ -658,6 +658,36 @@ impl Service {
         }
     }
 
+    pub(crate) fn join_ipv4_multicast(
+        &mut self,
+        group: Ipv4Address,
+        interface_id: InterfaceId,
+    ) -> NetResult {
+        if self.router.device_index_for_interface_id(interface_id).is_none() {
+            return Err(NetError::NoSuchDevice);
+        }
+        if !self.router.has_ipv4_multicast_group(group) {
+            self.iface.join_multicast_group(group).map_err(|error| match error {
+                smoltcp::iface::MulticastError::GroupTableFull => NetError::NoMemory,
+                smoltcp::iface::MulticastError::Unaddressable => NetError::InvalidInput,
+            })?;
+        }
+        self.router.add_ipv4_multicast_membership(group, interface_id);
+        Ok(())
+    }
+
+    pub(crate) fn leave_ipv4_multicast(
+        &mut self,
+        group: Ipv4Address,
+        interface_id: InterfaceId,
+    ) {
+        self.router.remove_ipv4_multicast_membership(group, interface_id);
+        if !self.router.has_ipv4_multicast_group(group) {
+            // A validated group cannot fail to leave; shared joins remain live.
+            let _ = self.iface.leave_multicast_group(group);
+        }
+    }
+
     /// Creates a TUN or TAP interface for `/dev/net/tun`, as `tun_set_iff`
     /// does. The interface starts down with no address.
     pub fn create_tun(&mut self, name: &str, kind: InterfaceKind) -> NetResult<Arc<TunShared>> {

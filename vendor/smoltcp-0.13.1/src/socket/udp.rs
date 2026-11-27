@@ -123,6 +123,10 @@ pub struct Socket<'a> {
     tx_buffer: PacketBuffer<'a>,
     /// The time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
     hop_limit: Option<u8>,
+    #[cfg(feature = "multicast")]
+    multicast_hop_limit: u8,
+    #[cfg(feature = "multicast")]
+    multicast_loop: bool,
     #[cfg(feature = "async")]
     rx_waker: WakerRegistration,
     #[cfg(feature = "async")]
@@ -137,6 +141,10 @@ impl<'a> Socket<'a> {
             rx_buffer,
             tx_buffer,
             hop_limit: None,
+            #[cfg(feature = "multicast")]
+            multicast_hop_limit: 1,
+            #[cfg(feature = "multicast")]
+            multicast_loop: true,
             #[cfg(feature = "async")]
             rx_waker: WakerRegistration::new(),
             #[cfg(feature = "async")]
@@ -210,6 +218,38 @@ impl<'a> Socket<'a> {
         }
 
         self.hop_limit = hop_limit
+    }
+
+    /// Return the time-to-live value used in outgoing IPv4 multicast packets.
+    ///
+    /// The default value is 1.
+    #[cfg(feature = "multicast")]
+    pub fn multicast_hop_limit(&self) -> u8 {
+        self.multicast_hop_limit
+    }
+
+    /// Set the time-to-live value used in outgoing IPv4 multicast packets.
+    ///
+    /// A value of 0 is accepted for packets restricted to the local host.
+    #[cfg(feature = "multicast")]
+    pub fn set_multicast_hop_limit(&mut self, hop_limit: u8) {
+        self.multicast_hop_limit = hop_limit;
+    }
+
+    /// Return whether outgoing IPv4 multicast packets request local echo.
+    ///
+    /// Local echo is enabled by default and must be implemented by the device.
+    #[cfg(feature = "multicast")]
+    pub fn multicast_loop(&self) -> bool {
+        self.multicast_loop
+    }
+
+    /// Set whether outgoing IPv4 multicast packets request local echo.
+    ///
+    /// The request is passed to the device through packet metadata.
+    #[cfg(feature = "multicast")]
+    pub fn set_multicast_loop(&mut self, enabled: bool) {
+        self.multicast_loop = enabled;
     }
 
     /// Bind the socket to the given endpoint.
@@ -481,6 +521,13 @@ impl<'a> Socket<'a> {
         if self.endpoint.port != repr.dst_port {
             return false;
         }
+        if let Some(addr) = self.endpoint.addr {
+            if (addr.is_multicast() || ip_repr.dst_addr().is_multicast())
+                && addr != ip_repr.dst_addr()
+            {
+                return false;
+            }
+        }
         if self.endpoint.addr.is_some()
             && self.endpoint.addr != Some(ip_repr.dst_addr())
             && !cx.is_broadcast(&ip_repr.dst_addr())
@@ -541,6 +588,10 @@ impl<'a> Socket<'a> {
     {
         let endpoint = self.endpoint;
         let hop_limit = self.hop_limit.unwrap_or(64);
+        #[cfg(feature = "multicast")]
+        let multicast_hop_limit = self.multicast_hop_limit;
+        #[cfg(feature = "multicast")]
+        let multicast_loop = self.multicast_loop;
 
         let res = self.tx_buffer.dequeue_with(|packet_meta, payload_buf| {
             let src_addr = if let Some(s) = packet_meta.local_address {
@@ -569,6 +620,27 @@ impl<'a> Socket<'a> {
                 payload_buf.len()
             );
 
+            #[cfg(feature = "multicast")]
+            let is_ipv4_multicast = match packet_meta.endpoint.addr {
+                #[cfg(feature = "proto-ipv4")]
+                IpAddress::Ipv4(addr) => addr.is_multicast(),
+                #[cfg(feature = "proto-ipv6")]
+                IpAddress::Ipv6(_) => false,
+            };
+            #[cfg(feature = "multicast")]
+            let hop_limit = if is_ipv4_multicast {
+                multicast_hop_limit
+            } else {
+                hop_limit
+            };
+            let meta = packet_meta.meta;
+            #[cfg(feature = "multicast")]
+            let meta = {
+                let mut meta = meta;
+                meta.multicast_loop = is_ipv4_multicast && multicast_loop;
+                meta
+            };
+
             let repr = UdpRepr {
                 src_port: endpoint.port,
                 dst_port: packet_meta.endpoint.port,
@@ -581,7 +653,7 @@ impl<'a> Socket<'a> {
                 hop_limit,
             );
 
-            emit(cx, packet_meta.meta, (ip_repr, repr, payload_buf))
+            emit(cx, meta, (ip_repr, repr, payload_buf))
         });
         match res {
             Err(Empty) => Ok(()),

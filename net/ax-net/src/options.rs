@@ -13,7 +13,7 @@
 //! the protocol that reports them.
 
 use alloc::{boxed::Box, sync::Arc};
-use core::{any::Any, fmt, time::Duration};
+use core::{any::Any, fmt, net::Ipv4Addr, time::Duration};
 
 use enum_dispatch::enum_dispatch;
 
@@ -221,6 +221,34 @@ impl From<u32> for UnixCredentials {
     }
 }
 
+/// IPv4 multicast output or membership interface selection.
+/// An unspecified address and no index ask the routing table to choose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ipv4MulticastInterface {
+    /// Local IPv4 address, or `0.0.0.0` for the interface's current address.
+    pub address: Ipv4Addr,
+    /// Interface index, taking precedence over address-based selection.
+    pub interface: Option<InterfaceId>,
+}
+
+impl Default for Ipv4MulticastInterface {
+    fn default() -> Self {
+        Self {
+            address: Ipv4Addr::UNSPECIFIED,
+            interface: None,
+        }
+    }
+}
+
+/// One IPv4 any-source multicast group membership request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ipv4MulticastMembership {
+    /// Multicast destination address in `224.0.0.0/4`.
+    pub group: Ipv4Addr,
+    /// Interface on which to join or leave the group.
+    pub interface: Ipv4MulticastInterface,
+}
+
 define_options! {
     // ---- Socket level options (SO_*) ----
     ReuseAddress(bool),
@@ -260,6 +288,11 @@ define_options! {
     RecvTrafficClass(bool),
     RecvErr(bool),
     IpMtuDiscover(u8),
+    Ipv4MulticastInterface(Ipv4MulticastInterface),
+    Ipv4MulticastTtl(u8),
+    Ipv4MulticastLoop(bool),
+    AddIpv4Membership(Ipv4MulticastMembership),
+    DropIpv4Membership(Ipv4MulticastMembership),
 
     // ---- Extra options ----
     NonBlocking(bool),

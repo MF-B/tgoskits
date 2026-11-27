@@ -76,6 +76,23 @@ impl State {
         }
     }
 
+    /// Return the next IPv4 multicast transmission deadline.
+    #[cfg(feature = "proto-ipv4")]
+    pub(crate) fn poll_at(&self) -> Option<crate::time::Instant> {
+        if self.groups.iter().any(|(addr, state)| {
+            matches!(addr, IpAddress::Ipv4(_))
+                && matches!(state, GroupState::Joining | GroupState::Leaving)
+        }) {
+            return Some(crate::time::Instant::from_millis(0));
+        }
+
+        match self.igmp_report_state {
+            IgmpReportState::Inactive => None,
+            IgmpReportState::ToGeneralQuery { timeout, .. }
+            | IgmpReportState::ToSpecificQuery { timeout, .. } => Some(timeout),
+        }
+    }
+
     pub(crate) fn has_multicast_group<T: Into<IpAddress>>(&self, addr: T) -> bool {
         // Return false if we don't have the multicast group,
         // or we're leaving it.
@@ -462,13 +479,29 @@ impl InterfaceInner {
         None
     }
 
+    /// Prefer a non-loopback IPv4 source for IGMP reports and leave messages.
+    #[cfg(feature = "proto-ipv4")]
+    fn igmp_source_address(&self) -> Option<Ipv4Address> {
+        self.ip_addrs
+            .iter()
+            .find_map(|cidr| match cidr {
+                IpCidr::Ipv4(cidr) => {
+                    let addr = cidr.address();
+                    (!addr.is_unspecified() && !addr.is_loopback()).then_some(addr)
+                }
+                #[cfg(feature = "proto-ipv6")]
+                IpCidr::Ipv6(_) => None,
+            })
+            .or_else(|| self.ipv4_addr())
+    }
+
     #[cfg(feature = "proto-ipv4")]
     fn igmp_report_packet<'any>(
         &self,
         version: IgmpVersion,
         group_addr: Ipv4Address,
     ) -> Option<Packet<'any>> {
-        let iface_addr = self.ipv4_addr()?;
+        let iface_addr = self.igmp_source_address()?;
         let igmp_repr = IgmpRepr::MembershipReport {
             group_addr,
             version,
@@ -490,7 +523,7 @@ impl InterfaceInner {
 
     #[cfg(feature = "proto-ipv4")]
     fn igmp_leave_packet<'any>(&self, group_addr: Ipv4Address) -> Option<Packet<'any>> {
-        self.ipv4_addr().map(|iface_addr| {
+        self.igmp_source_address().map(|iface_addr| {
             let igmp_repr = IgmpRepr::LeaveGroup { group_addr };
             Packet::new_ipv4(
                 Ipv4Repr {
